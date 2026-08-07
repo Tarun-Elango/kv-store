@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // each follower state( stored in lader)
@@ -52,6 +53,7 @@ func NewLeader(followerAddrs []string) *Leader {
 	return leader
 }
 
+// worker in routine waiting for either the leader to add an entry or close
 func (l *Leader) followerWorker(fs *FollowerState) {
 	defer l.wg.Done()
 	for {
@@ -62,7 +64,7 @@ func (l *Leader) followerWorker(fs *FollowerState) {
 			if !ok {
 				return
 			}
-			_ = entry
+			_ = l.replicateWithRetry(context.Background(), fs, entry)
 		}
 	}
 }
@@ -80,31 +82,39 @@ func (l *Leader) Replicate(ctx context.Context, entry Entry) error {
 		followers = append(followers, fs)
 	}
 	l.mu.Unlock()
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(followers))
 
-	// loop followers
 	for _, fs := range followers {
-		fs := fs
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := l.replicateToFollower(ctx, fs, entry); err != nil {
-				errCh <- err
-			}
-		}()
-	}
-
-	wg.Wait() // wait till all followers
-	close(errCh)
-
-	var firstErr error
-	for err := range errCh {
-		if firstErr == nil {
-			firstErr = err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-l.closed:
+			return fmt.Errorf("replication leader closed")
+		case fs.InFlightCh <- entry:
 		}
 	}
-	return firstErr
+	return nil
+}
+
+func (l *Leader) replicateWithRetry(ctx context.Context, fs *FollowerState, entry Entry) error {
+	const maxAttemps = 3
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttemps; attempt++ {
+		if err := l.replicateToFollower(ctx, fs, entry); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		backOff := time.Duration(50*(1<<attempt)) * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-l.closed:
+			return fmt.Errorf("replication leader closed")
+		case <-time.After(backOff):
+		}
+	}
+	return lastErr
 }
 
 // send one entry to follower

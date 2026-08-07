@@ -147,7 +147,3 @@ func ListenAndServeReplication(addr string, follower *Follower) {
 		go ServerReplication(conn, follower)
 	}
 }
-
-func (l *Leader) Close() {
-
-}
