@@ -49,6 +49,7 @@ func main() {
 		fmt.Println("wal replay error:", err)
 		return
 	}
+	//nextIndex := log.LastIndex() + 1
 
 	srv := server.New(st, log)
 	addr := ":9000"

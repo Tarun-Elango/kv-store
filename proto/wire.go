@@ -13,9 +13,10 @@ const (
 
 // status codes for responses
 const (
-	StatusOk       byte = 0
-	StatusNotFound byte = 1
-	StatusError    byte = 2
+	StatusOk        byte = 0
+	StatusNotFound  byte = 1
+	StatusError     byte = 2
+	StatusNotLeader byte = 3
 )
 
 const (
@@ -52,7 +53,7 @@ func ValidOpcode(op byte) bool {
 
 func validStatus(r byte) bool {
 	switch r {
-	case StatusError, StatusNotFound, StatusOk:
+	case StatusError, StatusNotFound, StatusOk, StatusNotLeader:
 		return true
 	default:
 		return false

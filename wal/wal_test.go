@@ -26,7 +26,7 @@ import (
 // - TestConcurrentAppend (mutex safety)
 
 func TestEncodeRecordRoundTrip(t *testing.T) {
-	rec := Record{Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}
+	rec := Record{Index: 1, Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}
 	var buf bytes.Buffer
 	err := EncodeRecord(&buf, rec)
 	if err != nil {
@@ -36,7 +36,7 @@ func TestEncodeRecordRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf(" error in decoding record")
 	}
-	if got.Op != rec.Op || !bytes.Equal(got.Key, rec.Key) || !bytes.Equal(got.Value, rec.Value) {
+	if got.Index != rec.Index || got.Op != rec.Op || !bytes.Equal(got.Key, rec.Key) || !bytes.Equal(got.Value, rec.Value) {
 		t.Fatalf("decoded record does not match encoded record")
 	}
 
@@ -44,6 +44,7 @@ func TestEncodeRecordRoundTrip(t *testing.T) {
 
 func TestEncodeRecordRejectsInvalidOp(t *testing.T) {
 	rec := Record{
+		Index: 1,
 		Op:    99,
 		Key:   []byte("k"),
 		Value: []byte("v"),
@@ -59,6 +60,7 @@ func TestEncodeRecordRejectsInvalidOp(t *testing.T) {
 func TestEncodeRecordRejectsTooLargeKey(t *testing.T) {
 	key := make([]byte, MaxKeyLen+1)
 	rec := Record{
+		Index: 1,
 		Op:    byte(OpSet),
 		Key:   key,
 		Value: []byte("v"),
@@ -74,6 +76,7 @@ func TestEncodeRecordRejectsTooLargeKey(t *testing.T) {
 func TestEncodeRecordRejectsTooLargeValue(t *testing.T) {
 	value := make([]byte, MaxValueLen+1)
 	rec := Record{
+		Index: 1,
 		Op:    byte(OpSet),
 		Key:   []byte("k"),
 		Value: value,
@@ -108,7 +111,7 @@ func TestDecodeRecordIncompleteTail(t *testing.T) {
 
 func TestDecodeRecordChecksumMismatch(t *testing.T) {
 	var buf bytes.Buffer
-	rec := Record{Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}
+	rec := Record{Index: 1, Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}
 	if err := EncodeRecord(&buf, rec); err != nil {
 		t.Fatalf("encode record: %v", err)
 	}
@@ -139,6 +142,14 @@ func TestOpenCreatesFileAndDir(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected file to exist: %v", err)
 	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read WAL header: %v", err)
+	}
+	if !bytes.Equal(data, walHeader) {
+		t.Fatalf("WAL header = %v, want %v", data, walHeader)
+	}
 }
 
 func TestAppendAndReplay(t *testing.T) {
@@ -151,9 +162,9 @@ func TestAppendAndReplay(t *testing.T) {
 
 	// 3 records
 	recs := []Record{
-		{Op: byte(OpSet), Key: []byte("a"), Value: []byte("1")},
-		{Op: byte(OpSet), Key: []byte("b"), Value: []byte("2")},
-		{Op: byte(OpDel), Key: []byte("a")},
+		{Index: 1, Op: byte(OpSet), Key: []byte("a"), Value: []byte("1")},
+		{Index: 2, Op: byte(OpSet), Key: []byte("b"), Value: []byte("2")},
+		{Index: 3, Op: byte(OpDel), Key: []byte("a")},
 	}
 
 	// append
@@ -185,9 +196,12 @@ func TestAppendAndReplay(t *testing.T) {
 		t.Fatalf("replayed %d records, want %d", len(got), len(recs))
 	}
 	for i := range recs {
-		if got[i].Op != recs[i].Op || !bytes.Equal(got[i].Key, recs[i].Key) || !bytes.Equal(got[i].Value, recs[i].Value) {
+		if got[i].Index != recs[i].Index || got[i].Op != recs[i].Op || !bytes.Equal(got[i].Key, recs[i].Key) || !bytes.Equal(got[i].Value, recs[i].Value) {
 			t.Fatalf("record %d = %#v, want %#v", i, got[i], recs[i])
 		}
+	}
+	if gotIndex := log.LastIndex(); gotIndex != 3 {
+		t.Fatalf("LastIndex() = %d, want 3", gotIndex)
 	}
 }
 
@@ -200,7 +214,7 @@ func TestReplayTruncatesIncompleteRecord(t *testing.T) {
 		t.Fatalf("open wal: %v", err)
 	}
 	// append first record
-	first := Record{Op: byte(OpSet), Key: []byte("a"), Value: []byte("1")}
+	first := Record{Index: 1, Op: byte(OpSet), Key: []byte("a"), Value: []byte("1")}
 	if err := log.Append(first); err != nil {
 		t.Fatalf("append valid record: %v", err)
 	}
@@ -257,7 +271,7 @@ func TestReplayTruncatesIncompleteRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read truncated wal: %v", err)
 	}
-	r := bytes.NewReader(data)
+	r := bytes.NewReader(data[len(walHeader):])
 	if _, err := DecodeRecord(r); err != nil {
 		t.Fatalf("decode first record after truncate: %v", err)
 	}
@@ -278,10 +292,10 @@ func TestReplayAppliesRecordsInOrder(t *testing.T) {
 	defer log.Close()
 
 	recs := []Record{
-		{Op: byte(OpSet), Key: []byte("k"), Value: []byte("1")},
-		{Op: byte(OpSet), Key: []byte("k"), Value: []byte("2")},
-		{Op: byte(OpDel), Key: []byte("k")},
-		{Op: byte(OpSet), Key: []byte("k"), Value: []byte("3")},
+		{Index: 1, Op: byte(OpSet), Key: []byte("k"), Value: []byte("1")},
+		{Index: 2, Op: byte(OpSet), Key: []byte("k"), Value: []byte("2")},
+		{Index: 3, Op: byte(OpDel), Key: []byte("k")},
+		{Index: 4, Op: byte(OpSet), Key: []byte("k"), Value: []byte("3")},
 	}
 	for i, rec := range recs {
 		if err := log.Append(rec); err != nil {
@@ -321,7 +335,7 @@ func TestCloseFlushesAndCloses(t *testing.T) {
 	}
 
 	// append record
-	want := Record{Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}
+	want := Record{Index: 1, Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}
 	if err := log.Append(want); err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -332,7 +346,7 @@ func TestCloseFlushesAndCloses(t *testing.T) {
 	}
 
 	// append after close, should error
-	if err := log.Append(Record{Op: byte(OpSet), Key: []byte("x"), Value: []byte("y")}); err == nil {
+	if err := log.Append(Record{Index: 2, Op: byte(OpSet), Key: []byte("x"), Value: []byte("y")}); err == nil {
 		t.Fatal("expected append on closed log to fail")
 	}
 
@@ -341,12 +355,12 @@ func TestCloseFlushesAndCloses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read wal: %v", err)
 	}
-	r := bytes.NewReader(data)
+	r := bytes.NewReader(data[len(walHeader):])
 	got, err := DecodeRecord(r)
 	if err != nil {
 		t.Fatalf("decode record: %v", err)
 	}
-	if got.Op != want.Op || !bytes.Equal(got.Key, want.Key) || !bytes.Equal(got.Value, want.Value) {
+	if got.Index != want.Index || got.Op != want.Op || !bytes.Equal(got.Key, want.Key) || !bytes.Equal(got.Value, want.Value) {
 		t.Fatalf("decoded record = %#v, want %#v", got, want)
 	}
 	if _, err := DecodeRecord(r); !errors.Is(err, io.EOF) {
@@ -381,7 +395,7 @@ func TestConcurrentAppend(t *testing.T) {
 
 			key := fmt.Sprintf("key-%03d", i)
 			value := bytes.Repeat([]byte{byte('a' + i%26)}, 2048)
-			rec := Record{Op: byte(OpSet), Key: []byte(key), Value: value}
+			rec := Record{Index: uint64(i + 1), Op: byte(OpSet), Key: []byte(key), Value: value}
 			if err := log.Append(rec); err != nil {
 				errCh <- fmt.Errorf("append %s: %w", key, err)
 			}
@@ -395,13 +409,22 @@ func TestConcurrentAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read WAL: %v", err)
+	}
+
 	got := make(map[string]Record, n)
-	// replay
-	if err := log.Replay(func(rec Record) error {
+	r := bytes.NewReader(data[len(walHeader):])
+	for {
+		rec, err := DecodeRecord(r)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode concurrent WAL record: %v", err)
+		}
 		got[string(rec.Key)] = rec
-		return nil
-	}); err != nil {
-		t.Fatalf("replay: %v", err)
 	}
 
 	if len(got) != n {
@@ -416,8 +439,59 @@ func TestConcurrentAppend(t *testing.T) {
 			t.Fatalf("missing record for %s", key)
 		}
 		wantValue := bytes.Repeat([]byte{byte('a' + i%26)}, 2048)
-		if rec.Op != byte(OpSet) || !bytes.Equal(rec.Key, []byte(key)) || !bytes.Equal(rec.Value, wantValue) {
+		if rec.Index == 0 || rec.Op != byte(OpSet) || !bytes.Equal(rec.Key, []byte(key)) || !bytes.Equal(rec.Value, wantValue) {
 			t.Fatalf("record %s = %#v, want op=%d value len=%d", key, rec, OpSet, len(wantValue))
 		}
+	}
+}
+
+// TestOpenRejectsLegacyWAL verifies that an unversioned WAL is rejected.
+func TestOpenRejectsLegacyWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.wal")
+	if err := os.WriteFile(path, []byte("legacy WAL"), 0600); err != nil {
+		t.Fatalf("write legacy WAL: %v", err)
+	}
+
+	_, err := Open(path)
+	if !errors.Is(err, ErrUnsupportedFormat) {
+		t.Fatalf("Open() error = %v, want ErrUnsupportedFormat", err)
+	}
+}
+
+// TestEncodeRecordRejectsZeroIndex verifies that records must have a valid log index.
+func TestEncodeRecordRejectsZeroIndex(t *testing.T) {
+	var buf bytes.Buffer
+	err := EncodeRecord(&buf, Record{Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")})
+	if !errors.Is(err, ErrInvalidIndex) {
+		t.Fatalf("EncodeRecord() error = %v, want ErrInvalidIndex", err)
+	}
+}
+
+// TestReplayRestoresLastIndex verifies that replay recovers the highest persisted index.
+func TestReplayRestoresLastIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+
+	log, err := Open(path)
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+	if err := log.Append(Record{Index: 7, Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}); err != nil {
+		t.Fatalf("append record: %v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+
+	log, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen WAL: %v", err)
+	}
+	defer log.Close()
+
+	if err := log.Replay(func(Record) error { return nil }); err != nil {
+		t.Fatalf("replay WAL: %v", err)
+	}
+	if got := log.LastIndex(); got != 7 {
+		t.Fatalf("LastIndex() = %d, want 7", got)
 	}
 }
