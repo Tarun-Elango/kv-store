@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"kvStore/proto"
+	"kvStore/replication"
 	"kvStore/store"
 	"kvStore/wal"
 	"net"
@@ -17,12 +18,29 @@ import (
 
 // reusable code
 // that defines type Server struct{...} and its methods
+type Config struct {
+	Role       replication.Role
+	LeaderAddr string
+	NextIndex  uint64
+
+	LeaderReplicator   *replication.Leader
+	FollowerReplicator *replication.Follower
+}
 
 // server will keep the store, contructor will create the struct,
 // prevents every function receiving the store
 type Server struct {
 	store *store.Store[string, []byte]
 	log   *wal.Log // pointer to wal.log ( has file descriptor and mutex)
+
+	role       replication.Role
+	leaderAddr string
+	nextIndex  uint64
+
+	leaderReplicator   *replication.Leader
+	followerReplicator *replication.Follower
+
+	writeMu sync.Mutex //serialize index allocation
 
 	listener    net.Listener          // lets shutdown() close it, cause shutdown can be called from different routine,
 	connections map[net.Conn]struct{} // clientConn1: {}, clientConn2: {}
@@ -31,6 +49,7 @@ type Server struct {
 	shuttingDown bool           // prevent accepting/starting while shutting down
 	handlers     sync.WaitGroup // lets shutdown() wait for all goroutines to finish
 	shutDownOnce sync.Once      // helps ensure shutdown only happens once, sync.once guarantees once execution - used in shutdown
+	logCloseOnce sync.Once
 }
 
 // constructor, takes store, returns server pointer
@@ -40,7 +59,27 @@ func New(s *store.Store[string, []byte], log *wal.Log) *Server {
 		log:         log,
 		connections: make(map[net.Conn]struct{}), // make a set, we keep value as empty struct - no mem alloc
 	}
+}
 
+func NewWithConfig(
+	st *store.Store[string, []byte],
+	log *wal.Log,
+	cfg *Config,
+) *Server {
+	if cfg.NextIndex == 0 {
+		cfg.NextIndex = 1
+	}
+
+	return &Server{
+		store:              st,
+		log:                log,
+		role:               cfg.Role,
+		leaderAddr:         cfg.LeaderAddr,
+		nextIndex:          cfg.NextIndex,
+		leaderReplicator:   cfg.LeaderReplicator,
+		followerReplicator: cfg.FollowerReplicator,
+		connections:        make(map[net.Conn]struct{}),
+	}
 }
 
 // listen for connections, accept, handle
@@ -97,7 +136,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	defer func() {
 		// cleanup variables from struct - when a client disconnets
-		conn.Close() // close connection
+		_ = conn.Close() // close connection
 		s.mu.Lock()
 		delete(s.connections, conn) // delete from pa
 		s.mu.Unlock()
@@ -129,6 +168,20 @@ func (s *Server) shutdown() {
 			_ = conn.SetDeadline(deadline) // immediately stop any live conn, by forcing timeout error
 		}
 		s.handlers.Wait() // wait till all goroutine have decreemented till 0
+
+		if s.leaderReplicator != nil {
+			s.leaderReplicator.Close()
+		}
+
+		if s.followerReplicator != nil {
+			_ = s.followerReplicator.Close()
+		}
+
+		s.logCloseOnce.Do(func() {
+			if s.log != nil {
+				_ = s.log.Close()
+			}
+		})
 	})
 }
 
@@ -175,31 +228,15 @@ func (s *Server) dispatch(cmd proto.Command) (proto.Response, error) {
 			return proto.Response{Status: proto.StatusNotFound}, nil
 		}
 		return proto.Response{Status: proto.StatusOk, Value: val}, nil
-	case proto.OpSet:
-		rec := wal.Record{
-			Op:    byte(wal.OpSet),
-			Key:   append([]byte(nil), cmd.Key...), // deep copy
-			Value: append([]byte(nil), cmd.Value...),
-		}
-		if err := s.log.Append(rec); err != nil {
-			return proto.Response{Status: proto.StatusError}, err
+	case proto.OpSet, proto.OpDel:
+		if s.role != replication.RoleLeader {
+			return proto.Response{
+				Status: proto.StatusNotLeader,
+				Value:  []byte(s.leaderAddr),
+			}, nil
 		}
 
-		s.store.Set(string(cmd.Key), cmd.Value)
-		return proto.Response{Status: proto.StatusOk}, nil
-
-	case proto.OpDel:
-
-		rec := wal.Record{
-			Op:  byte(wal.OpDel),
-			Key: append([]byte(nil), cmd.Key...), // deep copy
-		}
-
-		if err := s.log.Append(rec); err != nil {
-			return proto.Response{Status: proto.StatusError}, err
-		}
-		s.store.Delete(string(cmd.Key))
-		return proto.Response{Status: proto.StatusOk}, nil
+		return s.applyLeaderWrite(cmd)
 
 	case proto.OpPing:
 		return proto.Response{Status: proto.StatusOk}, nil
@@ -212,4 +249,82 @@ func (s *Server) dispatch(cmd proto.Command) (proto.Response, error) {
 		return proto.Response{Status: proto.StatusError}, nil
 
 	}
+}
+
+// write pipeline for reader ( set/del	)
+func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	if s.log == nil {
+		return proto.Response{
+			Status: proto.StatusError,
+			Value:  []byte("server WAL is unavailable"),
+		}, nil
+	}
+
+	entry := replication.Entry{
+		Index: s.nextIndex,
+		Command: proto.Command{
+			Op:    cmd.Op,
+			Key:   append([]byte(nil), cmd.Key...),
+			Value: append([]byte(nil), cmd.Value...),
+		},
+	}
+
+	record, err := recordFromEntry(entry)
+	if err != nil {
+		return proto.Response{
+			Status: proto.StatusError,
+			Value:  []byte(err.Error()),
+		}, nil
+	}
+
+	//durable local write first.
+	if err := s.log.Append(record); err != nil {
+		return proto.Response{
+			Status: proto.StatusError,
+			Value:  []byte(err.Error()),
+		}, nil
+	}
+
+	// apply after wal good
+	switch cmd.Op {
+	case proto.OpSet:
+		s.store.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
+	case proto.OpDel:
+		s.store.Delete(string(cmd.Key))
+	}
+
+	s.nextIndex++
+
+	// async replicate
+	if s.leaderReplicator != nil {
+		if err := s.leaderReplicator.Replicate(context.Background(), entry); err != nil {
+			fmt.Printf("replication enqueue error for index %d: %v\n", entry.Index, err)
+		}
+	}
+
+	return proto.Response{Status: proto.StatusOk}, nil
+}
+
+func recordFromEntry(entry replication.Entry) (wal.Record, error) {
+	record := wal.Record{
+		Index: entry.Index,
+		Key:   append([]byte(nil), entry.Command.Key...),
+		Value: append([]byte(nil), entry.Command.Value...),
+	}
+	switch entry.Command.Op {
+	case proto.OpSet:
+		record.Op = byte(wal.OpSet)
+	case proto.OpDel:
+		record.Op = byte(wal.OpDel)
+	default:
+		return wal.Record{}, fmt.Errorf(
+			"unsupported replicated command op: %d",
+			entry.Command.Op,
+		)
+	}
+
+	return record, nil
 }

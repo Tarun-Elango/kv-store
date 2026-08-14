@@ -119,6 +119,8 @@ func send(reader io.Reader, writer *bufio.Writer, command proto.Command) {
 		fmt.Println("key not found")
 	case proto.StatusError:
 		fmt.Println("server error")
+	case proto.StatusNotLeader:
+		fmt.Printf("not leader; use %s\n", string(resp.Value))
 	default:
 		fmt.Println("unknown response status")
 	}

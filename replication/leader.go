@@ -7,148 +7,170 @@ import (
 	"time"
 )
 
+const (
+	replicationBatchSize = 64
+	initialRetryBackoff  = 50 * time.Millisecond
+	maxRetryBackoff      = 2 * time.Second
+	rpcTimeout           = 5 * time.Second
+)
+
 // each follower state( stored in lader)
 type FollowerState struct {
-	Addr       string
-	NextIndex  uint64
-	Client     PeerClient
-	InFlightCh chan Entry
+	Addr      string
+	NextIndex uint64
+	Client    PeerClient
+
+	// wake tells the worker leader has new entries
+	wake chan struct{}
 }
 
 // keeps track of followers
 type Leader struct {
-	followers map[string]*FollowerState
+	ID string
+
 	mu        sync.Mutex
-	closed    chan struct{}
+	entries   []Entry
+	followers map[string]*FollowerState
+
+	ctx       context.Context
+	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	closeOnce sync.Once
-	ID        string
 }
 
-func NewLeader(followerAddrs []string) *Leader {
-	// create one follower state per follower address
-	// create a network client for each follower
-	// create worker goroutine per follower
-	const inFlightBufferSize = 28
+// creates new leader with entries recoverd from its wal
+// intial entries need to be continguous - starting at 1
+func NewLeader(
+	nodeId string,
+	initialEntries []Entry,
+	followerAddrs []string) (*Leader, error) {
+	entries := make([]Entry, len(initialEntries))
+
+	// rebuild from wal to entries
+	for i, entry := range initialEntries {
+		expectedIndex := uint64(i + 1)
+		if entry.Index != expectedIndex {
+			return nil, fmt.Errorf(
+				"leader log is not contiguous: got index %d, want %d",
+				entry.Index,
+				expectedIndex,
+			)
+		}
+		entries[i] = cloneEntry(entry) //
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	leader := &Leader{
+		ID:        nodeId,
+		entries:   entries,
 		followers: make(map[string]*FollowerState),
-		closed:    make(chan struct{}),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
+	// for each follower, create connection, nextIndex+1, create wake signal
+	// start replciation goroutine
 	for _, addr := range followerAddrs {
-		fs := &FollowerState{
-			Addr:       addr,
-			NextIndex:  1,
-			Client:     NewTCPPeerClient(addr),
-			InFlightCh: make(chan Entry, inFlightBufferSize),
+		if addr == "" {
+			return nil, fmt.Errorf("replication: follower address is empty")
 		}
 
-		leader.followers[addr] = fs
+		if _, exists := leader.followers[addr]; exists {
+			continue
+		}
+
+		follower := &FollowerState{
+			Addr:      addr,
+			NextIndex: 1,
+			Client:    NewTCPPeerClient(addr),
+			wake:      make(chan struct{}, 1),
+		}
+		leader.followers[addr] = follower
 		leader.wg.Add(1)
 
-		go leader.followerWorker(fs)
+		// goroutine
+		go leader.followerWorker(follower)
 	}
 
-	return leader
+	return leader, nil
+
 }
 
-// worker in routine waiting for either the leader to add an entry or close
-func (l *Leader) followerWorker(fs *FollowerState) {
+// syncs one follower
+// performs initial sync, then waits for new entries, failed retry forever
+func (l *Leader) followerWorker(follower *FollowerState) {
 	defer l.wg.Done()
+	backoff := initialRetryBackoff
+
 	for {
-		select {
-		case <-l.closed: // closed is channel (indicate leader shutting down)
-			return
-		case entry, ok := <-fs.InFlightCh: // entry has channel value, ok tells if still open
-			if !ok {
+		more, err := l.replicateNextBatch(follower)
+		if err != nil {
+			if !l.waitForRetry(backoff) {
 				return
 			}
-			_ = l.replicateWithRetry(context.Background(), fs, entry)
+			backoff *= 2
+			if backoff > maxRetryBackoff {
+				backoff = maxRetryBackoff
+			}
+			continue
+		}
+		backoff = initialRetryBackoff
+		if more {
+			// follower still behind, send next batch
+			continue
+		}
+		select {
+		case <-l.ctx.Done():
+			return
+		case <-follower.wake:
+			// new leader entry is available
 		}
 	}
 }
 
-// when leader has to replicate a write
-// wraps as entry obj - and sends to all follower queue
+// Replicate publishes an indexed entry to the leader log
+//
+// waits for entry to be queued locally, it does not wait for followers
+// as thats async
 func (l *Leader) Replicate(ctx context.Context, entry Entry) error {
-	// for each follower
-	// 	send entry to each follower worker queue
-	// no need to spawn unbounded go routines
-	// wait for ack ( depend on policy )
-	l.mu.Lock()
-	followers := make([]*FollowerState, 0, len(l.followers))
-	for _, fs := range l.followers {
-		followers = append(followers, fs)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	l.mu.Unlock()
-
-	for _, fs := range followers {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-l.closed:
-			return fmt.Errorf("replication leader closed")
-		case fs.InFlightCh <- entry:
-		}
-	}
-	return nil
-}
-
-func (l *Leader) replicateWithRetry(ctx context.Context, fs *FollowerState, entry Entry) error {
-	const maxAttemps = 3
-
-	var lastErr error
-	for attempt := 0; attempt < maxAttemps; attempt++ {
-		if err := l.replicateToFollower(ctx, fs, entry); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		backOff := time.Duration(50*(1<<attempt)) * time.Millisecond
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-l.closed:
-			return fmt.Errorf("replication leader closed")
-		case <-time.After(backOff):
-		}
-	}
-	return lastErr
-}
-
-// send one entry to follower
-func (l *Leader) replicateToFollower(ctx context.Context, fs *FollowerState, entry Entry) error {
-	//Build appendrequest
-	// send to follower
-	// wait for response
-	// if success: follower.nextindex
-	// else: retry / handle error
-	if fs == nil || fs.Client == nil {
-		return fmt.Errorf("replication: nil follower state/client")
-	}
-
-	prevIndex := uint64(0)
-	if fs.NextIndex > 0 {
-		prevIndex = fs.NextIndex - 1
-	}
-
-	req := AppendRequest{
-		LeaderID:  l.ID,
-		PrevIndex: prevIndex,
-		Entries:   []Entry{entry},
-	}
-	resp, err := fs.Client.Append(ctx, req)
-	if err != nil {
-		return err
-	}
-	if !resp.Success {
-		return fmt.Errorf("replication failed for %s: %s", fs.Addr, resp.Error)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
 
 	l.mu.Lock()
-	fs.NextIndex = resp.LastIndex + 1
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+
+	select {
+	case <-l.ctx.Done():
+		return fmt.Errorf("replication leader closed")
+	default:
+	}
+
+	expectedIndex := uint64(len(l.entries) + 1)
+	if entry.Index != expectedIndex {
+		return fmt.Errorf(
+			"leader entry index mismatch: got %d, want %d",
+			entry.Index,
+			expectedIndex,
+		)
+	}
+	l.entries = append(l.entries, cloneEntry(entry))
+
+	// coalesce notifications.
+	// worker will inspect full log and send missing entry
+	for _, follower := range l.followers {
+		select {
+		case follower.wake <- struct{}{}:
+		default:
+		}
+	}
+
 	return nil
 }
 
@@ -158,15 +180,161 @@ func (l *Leader) Close() {
 	// wait for them to stop
 	// close network clients
 	l.closeOnce.Do(func() {
-		close(l.closed) // send signal to channel
+		l.cancel()
+		// peer client should honor cancel context
 		l.wg.Wait()
 
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		for _, fs := range l.followers {
-			if fs != nil && fs.Client != nil {
-				_ = fs.Client.Close()
+
+		for _, follower := range l.followers {
+			if follower.Client != nil {
+				_ = follower.Client.Close()
 			}
 		}
 	})
 }
+
+func (l *Leader) waitForRetry(delay time.Duration) bool {
+	timer := time.NewTicker(delay)
+	defer timer.Stop()
+
+	select {
+	case <-l.ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// called by followerWorker()
+// figure what follower missing
+// grab from leaders logs
+// send to follower, and check response
+// update follower.nextindex
+func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
+	l.mu.Lock()
+
+	nextIndex := follower.NextIndex
+	if nextIndex == 0 {
+		nextIndex = 1
+		follower.NextIndex = nextIndex
+	}
+	logLength := uint64(len(l.entries))
+
+	if nextIndex > logLength+1 {
+		l.mu.Unlock()
+		return false, fmt.Errorf(
+			"follower %s is ahead of leader: next index %d, leader last index %d",
+			follower.Addr,
+			nextIndex,
+			logLength,
+		)
+	}
+	var entries []Entry
+	// check if anything to send
+	if nextIndex <= logLength {
+		start := int(nextIndex - 1)         //entry.index to slice
+		end := start + replicationBatchSize // send a batch
+		if end > len(l.entries) {
+			end = len(l.entries)
+		}
+
+		// make seperate batch
+		entries = make([]Entry, end-start)
+		for i := range entries {
+			entries[i] = cloneEntry(l.entries[start+i])
+		}
+	}
+	prevIndex := nextIndex - 1
+	leaderID := l.ID
+	l.mu.Unlock()
+
+	req := AppendRequest{
+		LeaderID:  leaderID,
+		PrevIndex: prevIndex,
+		Entries:   entries,
+	}
+
+	rpcCtx, cancel := context.WithTimeout(l.ctx, rpcTimeout)
+	resp, err := follower.Client.Append(rpcCtx, req)
+	cancel()
+
+	if err != nil {
+		return false, fmt.Errorf(
+			"replication to %s failed: %w",
+			follower.Addr,
+			err,
+		)
+	}
+
+	if !resp.Success {
+		// The follower tells us the last index it actually has. Resume from
+		// there instead of retrying the same invalid request forever.
+		l.mu.Lock()
+		follower.NextIndex = resp.LastIndex + 1
+		l.mu.Unlock()
+		return false, fmt.Errorf(
+			"follower %s rejected append: %s; retrying from index %d",
+			follower.Addr,
+			resp.Error,
+			resp.LastIndex+1,
+		)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// follower cant be behind prevINdex
+	if resp.LastIndex < prevIndex {
+		return false, fmt.Errorf(
+			"follower %s returned invalid last index %d; expected at least %d",
+			follower.Addr,
+			resp.LastIndex,
+			prevIndex,
+		)
+	}
+
+	// follower must have accepted entries we sent
+	// if we send 4,5,6, response should be 6 not 4
+	// follower worker gets error and we retry from 4 again
+	if len(entries) > 0 {
+		expectedLastIndex := entries[len(entries)-1].Index
+		if resp.LastIndex < expectedLastIndex {
+			return false, fmt.Errorf(
+				"follower %s acknowledged index %d; expected at least %d",
+				follower.Addr,
+				resp.LastIndex,
+				expectedLastIndex,
+			)
+		}
+	}
+
+	// follower cant be ahed of leader
+	if resp.LastIndex > uint64(len(l.entries)) {
+		return false, fmt.Errorf(
+			"follower %s reported index %d, beyond leader last index %d",
+			follower.Addr,
+			resp.LastIndex,
+			len(l.entries),
+		)
+	}
+
+	follower.NextIndex = resp.LastIndex + 1
+	//More entries may have been appended while the RPC was in flight.
+	return follower.NextIndex <= uint64(len(l.entries)), nil
+}
+
+// func cloneEntry(entry Entry) Entry{
+// 	return Entry{
+// 		Index: entry.Index,
+// 		Command: cloneCommand(entry.Command)
+// 	}
+// }
+
+// func cloneCommand(command proto.Command) proto.Command{
+// 	return proto.Command{
+// 		Op: command.Op,
+// 		Key: append([]byte(nil), command.Key...),
+// 		Value: applyCommand([]byte(nil), command.Value...),
+// 	}
+// }

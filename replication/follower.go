@@ -108,9 +108,10 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 	if req.LeaderID == "" {
 		return fail(fmt.Errorf("leader ID is required"))
 	}
-	if req.PrevIndex != f.lastApplied {
+
+	if req.LeaderID != f.leaderID {
 		return fail(fmt.Errorf(
-			"unexpected leader ID: got %q want %q",
+			"unauthorized leader ID: got %q want %q",
 			req.LeaderID,
 			f.leaderID,
 		))
@@ -130,11 +131,6 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 				"previous index %d is not present",
 				req.PrevIndex,
 			))
-		}
-
-		return AppendResponse{
-			Success:   true,
-			LastIndex: f.lastApplied,
 		}
 	}
 

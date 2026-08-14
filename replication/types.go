@@ -15,6 +15,21 @@ const (
 	RoleFollower             // this will get 1
 )
 
+func (r Role) String() string {
+	switch r {
+	case RoleLeader:
+		return "leader"
+	case RoleFollower:
+		return "follower"
+	default:
+		return "unknown"
+	}
+}
+
+func (r Role) Valid() bool {
+	return r == RoleLeader || r == RoleFollower
+}
+
 // one replication operation
 // index 5
 // command SET user:1 Tarun
