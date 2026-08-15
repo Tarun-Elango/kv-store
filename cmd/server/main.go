@@ -82,6 +82,7 @@ func run() error {
 func runLeader(ctx context.Context, opts options) error {
 	st := store.NewStore[string, []byte]()
 
+	// open wal
 	log, err := wal.Open(opts.walPath)
 	if err != nil {
 		return fmt.Errorf("open leader WAL: %w", err)
@@ -89,6 +90,7 @@ func runLeader(ctx context.Context, opts options) error {
 
 	entries := make([]replication.Entry, 0)
 
+	// replay and apply each command from log
 	err = log.Replay(func(rec wal.Record) error {
 		entry, err := entryFromRecord(rec)
 		if err != nil {
@@ -104,12 +106,14 @@ func runLeader(ctx context.Context, opts options) error {
 		return fmt.Errorf("replay leader WAL: %w", err)
 	}
 
+	// get all followers addrs
 	followerAddrs, err := parseAddresses(opts.followers)
 	if err != nil {
 		_ = log.Close()
 		return err
 	}
 
+	// create leader
 	leaderReplicator, err := replication.NewLeader(
 		opts.nodeID,
 		entries,
@@ -120,6 +124,8 @@ func runLeader(ctx context.Context, opts options) error {
 		return fmt.Errorf("create leader replicator: %w", err)
 	}
 
+	// once leader created and its memory updated
+	// create a server to listen
 	srv := server.NewWithConfig(
 		st,
 		log,
@@ -137,6 +143,7 @@ func runLeader(ctx context.Context, opts options) error {
 		followerAddrs,
 	)
 
+	// serve
 	serveErr := srv.Serve(ctx, opts.clientAddr)
 
 	leaderReplicator.Close()
@@ -149,11 +156,21 @@ func runLeader(ctx context.Context, opts options) error {
 	return nil
 }
 
+// runFollower()
+//
+//	└─ NewReplicationServer(...)
+//	     └─ peerServer.Serve()        // listens for TCP connections
+//	          └─ s.serveConnection(conn)
+//	               └─ serveReplicationConnection(...)
+//	                    └─ for loop
+//	                         ├─ waits for AppendRequest
+//	                         ├─ calls follower.ApplyAppend(req)
+//	                         └─ sends AppendResponse
 func runFollower(ctx context.Context, opts options) error {
 	if opts.leaderID == "" {
 		return fmt.Errorf("-leader-id is required for followers")
 	}
-	st := store.NewStore[string, []byte]()
+	st := store.NewStore[string, []byte]() // follower store
 
 	// opens followers wal, replays, returns follower that can apply replication request
 	follower, err := replication.NewFollower(

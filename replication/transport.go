@@ -67,6 +67,7 @@ func (c *TCPPeerClient) Append(ctx context.Context, req AppendRequest) (AppendRe
 	if c.conn == nil {
 		dialer := net.Dialer{}
 
+		// c is follower, this func called by leader
 		conn, err := dialer.DialContext(ctx, "tcp", c.addr)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -373,7 +374,7 @@ func serveReplicationConnection(
 		}
 
 		var req AppendRequest
-		if err := decoder.Decode(&req); err != nil {
+		if err := decoder.Decode(&req); err != nil { // <- blocking, until appendrequest arrives
 			if errors.Is(err, io.EOF) {
 				return
 			}

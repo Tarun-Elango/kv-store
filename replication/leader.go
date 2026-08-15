@@ -53,7 +53,7 @@ func NewLeader(
 		return nil, fmt.Errorf("replication: leader ID cannot be empty")
 	}
 
-	entries := make([]Entry, len(initialEntries))
+	entries := make([]Entry, len(initialEntries)) // this is leaders private in memory log
 
 	// rebuild from wal to entries
 	for i, entry := range initialEntries {
@@ -87,6 +87,7 @@ func NewLeader(
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	//create leader
 	leader := &Leader{
 		ID:        nodeId,
 		entries:   entries,
@@ -199,7 +200,7 @@ func (l *Leader) Replicate(ctx context.Context, entry Entry) error {
 	// worker will inspect full log and send missing entry
 	for _, follower := range l.followers {
 		select {
-		case follower.wake <- struct{}{}:
+		case follower.wake <- struct{}{}: // leader.go followerWorker() wakes up follower -> replicate next batch
 		default:
 		}
 	}
@@ -385,7 +386,7 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 
 	follower.NextIndex = resp.LastIndex + 1
 	//More entries may have been appended while the RPC was in flight.
-	return follower.NextIndex <= uint64(len(l.entries)), nil
+	return follower.NextIndex <= uint64(len(l.entries)), nil // still some left
 }
 
 // func cloneEntry(entry Entry) Entry{

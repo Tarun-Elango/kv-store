@@ -129,7 +129,7 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 		s.handlers.Add(1)                // counter
 		s.mu.Unlock()
 		fmt.Printf("client connected: %s\n", conn.RemoteAddr())
-		go s.serveConn(ctx, conn) // new routine serve
+		go s.serveConn(ctx, conn) // new routine serve each client conn
 	}
 }
 
