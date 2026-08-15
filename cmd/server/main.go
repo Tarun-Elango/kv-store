@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"kvStore/proto"
+	"kvStore/replication"
 	"kvStore/server"
 	"kvStore/store"
 	"kvStore/wal"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 )
 
@@ -16,8 +20,47 @@ import (
 // creates a server.Server, decides on :9000),
 // and calls .Serve(). It's glue, not logic.
 
+type options struct {
+	nodeID          string
+	role            string
+	clientAddr      string
+	replicationAddr string
+	walPath         string
+	leaderID        string
+	leaderAddr      string
+	followers       string
+}
+
 func main() {
-	// context cancelled with ctrl-c, or when os asks to stop (sigterm)
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	var opts options
+
+	// cmd options, user input will be assigned to theses
+
+	flag.StringVar(&opts.nodeID, "node-id", "", "unique node ID")
+	flag.StringVar(&opts.role, "role", "leader", "node role: leader or follower")
+	flag.StringVar(&opts.clientAddr, "client-addr", ":9000", "client listen address")
+	flag.StringVar(&opts.replicationAddr, "replication-addr", ":9001", "follower replication listen address")
+	flag.StringVar(&opts.walPath, "wal", "data/wal.log", "WAL file path")
+	flag.StringVar(&opts.leaderID, "leader-id", "", "expected leader ID; required for followers")
+	flag.StringVar(&opts.leaderAddr, "leader-addr", "", "leader client address returned to clients")
+	flag.StringVar(&opts.followers, "followers", "", "comma-separated follower replication addresses")
+	flag.Parse() // parse the cmd line arguments
+
+	if opts.nodeID == "" {
+		return fmt.Errorf("-node-id is required")
+	}
+	role, err := parseRole(opts.role)
+	if err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -25,36 +68,232 @@ func main() {
 	)
 	defer stop()
 
-	st := store.NewStore[string, []byte]() // pointer to store
-	log, err := wal.Open("data/wal.log")
+	switch role {
+	case replication.RoleLeader:
+		return runLeader(ctx, opts)
+	case replication.RoleFollower:
+		return runFollower(ctx, opts)
+	default:
+		return fmt.Errorf("unsupported role : %s", opts.role)
+	}
+
+}
+
+func runLeader(ctx context.Context, opts options) error {
+	st := store.NewStore[string, []byte]()
+
+	log, err := wal.Open(opts.walPath)
 	if err != nil {
-		fmt.Println("wal open error:", err)
-		return
+		return fmt.Errorf("open leader WAL: %w", err)
 	}
-	defer log.Close()
 
-	// replaying log
-	if err := log.Replay(func(rec wal.Record) error {
-		//	fmt.Printf("op=%d key=%q value=%q\n", rec.Op, rec.Key, rec.Value)
-		switch rec.Op {
-		case byte(wal.OpSet):
-			st.Set(string(rec.Key), rec.Value)
-		case byte(wal.OpDel):
-			st.Delete(string(rec.Key))
-		default:
-			return wal.ErrUnknownOp
+	entries := make([]replication.Entry, 0)
+
+	err = log.Replay(func(rec wal.Record) error {
+		entry, err := entryFromRecord(rec)
+		if err != nil {
+			return err
 		}
+		applyCommand(st, entry.Command)
+		entries = append(entries, entry)
 		return nil
-	}); err != nil {
-		fmt.Println("wal replay error:", err)
-		return
-	}
-	//nextIndex := log.LastIndex() + 1
+	})
 
-	srv := server.New(st, log)
-	addr := ":9000"
-	fmt.Printf("listening on %s\n", addr)
-	if err := srv.Serve(ctx, addr); err != nil {
-		fmt.Println("server error:", err)
+	if err != nil {
+		_ = log.Close()
+		return fmt.Errorf("replay leader WAL: %w", err)
+	}
+
+	followerAddrs, err := parseAddresses(opts.followers)
+	if err != nil {
+		_ = log.Close()
+		return err
+	}
+
+	leaderReplicator, err := replication.NewLeader(
+		opts.nodeID,
+		entries,
+		followerAddrs,
+	)
+	if err != nil {
+		_ = log.Close()
+		return fmt.Errorf("create leader replicator: %w", err)
+	}
+
+	srv := server.NewWithConfig(
+		st,
+		log,
+		&server.Config{
+			Role:             replication.RoleLeader,
+			NextIndex:        log.LastIndex() + 1,
+			LeaderReplicator: leaderReplicator,
+		},
+	)
+
+	fmt.Printf(
+		"starting leader node=%s client=%s followers=%v\n",
+		opts.nodeID,
+		opts.clientAddr,
+		followerAddrs,
+	)
+
+	serveErr := srv.Serve(ctx, opts.clientAddr)
+
+	leaderReplicator.Close()
+	_ = log.Close()
+
+	if serveErr != nil {
+		return fmt.Errorf("leader server: %w", serveErr)
+	}
+
+	return nil
+}
+
+func runFollower(ctx context.Context, opts options) error {
+	if opts.leaderID == "" {
+		return fmt.Errorf("-leader-id is required for followers")
+	}
+	st := store.NewStore[string, []byte]()
+
+	// opens followers wal, replays, returns follower that can apply replication request
+	follower, err := replication.NewFollower(
+		opts.walPath,
+		st,
+		opts.leaderID,
+	)
+	if err != nil {
+		return fmt.Errorf("create follower: %w", err)
+	}
+
+	// ctx is process level ( sigterm, sigint)
+	// child to coordianate the followers two server
+	// flow sigterm -> ctx cancelled -> runctx cancelled -> stopped
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// start replication server
+	peerServer, err := replication.NewReplicationServer(
+		runCtx,
+		opts.replicationAddr,
+		follower,
+	)
+	if err != nil {
+		_ = follower.Close()
+		return fmt.Errorf("create replication server: %w", err)
+	}
+
+	srv := server.NewWithConfig(
+		st,
+		nil, // follower WAL is owned by replication.Follower
+		&server.Config{
+			Role:               replication.RoleFollower,
+			LeaderAddr:         opts.leaderAddr,
+			FollowerReplicator: follower,
+		},
+	)
+
+	peerErrCh := make(chan error, 1)
+
+	// run replicator listener in goroutine
+	go func() {
+		err := peerServer.Serve()
+		if err != nil && runCtx.Err() == nil {
+			cancel()
+		}
+
+		peerErrCh <- err
+	}()
+	fmt.Printf(
+		"starting follower node=%s client=%s replication=%s leader=%s\n",
+		opts.nodeID,
+		opts.clientAddr,
+		opts.replicationAddr,
+		opts.leaderID,
+	)
+
+	serveErr := srv.Serve(runCtx, opts.clientAddr)
+	cancel()
+	_ = peerServer.Close()
+
+	peerErr := <-peerErrCh
+	_ = follower.Close()
+	if serveErr != nil {
+		return fmt.Errorf("follower server: %w", serveErr)
+	}
+
+	if peerErr != nil && ctx.Err() == nil {
+		return fmt.Errorf("replication server: %w", peerErr)
+	}
+
+	return nil
+}
+
+func parseRole(value string) (replication.Role, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "leader":
+		return replication.RoleLeader, nil
+	case "follower":
+		return replication.RoleFollower, nil
+	default:
+		return replication.Role(0), fmt.Errorf(
+			"invalid -role %q: expected leader or follower",
+			value,
+		)
+	}
+}
+
+func parseAddresses(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(value, ",")
+	addresses := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		addr := strings.TrimSpace(part)
+		if addr == "" {
+			return nil, fmt.Errorf("followers contains an empty address")
+		}
+
+		addresses = append(addresses, addr)
+	}
+	return addresses, nil
+}
+
+func entryFromRecord(rec wal.Record) (replication.Entry, error) {
+	var op byte
+
+	switch rec.Op {
+	case byte(wal.OpSet):
+		op = proto.OpSet
+	case byte(wal.OpDel):
+		op = proto.OpDel
+	default:
+		return replication.Entry{}, fmt.Errorf(
+			"unsupported WAL operation: %d",
+			rec.Op,
+		)
+	}
+
+	return replication.Entry{
+		Index: rec.Index,
+		Command: proto.Command{
+			Op:    op,
+			Key:   append([]byte(nil), rec.Key...),
+			Value: append([]byte(nil), rec.Value...),
+		},
+	}, nil
+}
+
+func applyCommand(
+	st *store.Store[string, []byte],
+	cmd proto.Command,
+) {
+	switch cmd.Op {
+	case proto.OpSet:
+		st.Set(string(cmd.Key), append([]byte(nil), cmd.Value...))
+	case proto.OpDel:
+		st.Delete(string(cmd.Key))
 	}
 }

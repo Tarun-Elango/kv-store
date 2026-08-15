@@ -93,24 +93,25 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	fail := func(err error) AppendResponse {
+	fail := func(code AppendErrorCode, err error) AppendResponse {
 		return AppendResponse{
 			Success:   false,
 			LastIndex: f.lastApplied,
+			Code:      code,
 			Error:     err.Error(),
 		}
 	}
 
 	if f.closed {
-		return fail(fmt.Errorf("follower is closed"))
+		return fail(AppendErrorInternal, fmt.Errorf("follower is closed"))
 	}
 
 	if req.LeaderID == "" {
-		return fail(fmt.Errorf("leader ID is required"))
+		return fail(AppendErrorInvalid, fmt.Errorf("leader ID is required"))
 	}
 
 	if req.LeaderID != f.leaderID {
-		return fail(fmt.Errorf(
+		return fail(AppendErrorInvalid, fmt.Errorf(
 			"unauthorized leader ID: got %q want %q",
 			req.LeaderID,
 			f.leaderID,
@@ -118,7 +119,7 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 	}
 
 	if req.PrevIndex > f.lastApplied {
-		return fail(fmt.Errorf(
+		return fail(AppendErrorGap, fmt.Errorf(
 			"prev index is ahead of follower: got %d want at most %d",
 			req.PrevIndex,
 			f.lastApplied,
@@ -126,18 +127,35 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 	}
 
 	if req.PrevIndex > 0 {
-		if _, ok := f.entries[req.PrevIndex]; !ok {
-			return fail(fmt.Errorf(
+		previous, ok := f.entries[req.PrevIndex]
+		if !ok {
+			return fail(AppendErrorGap, fmt.Errorf(
 				"previous index %d is not present",
 				req.PrevIndex,
 			))
 		}
+		if req.PrevEntry == nil || req.PrevEntry.Index != req.PrevIndex {
+			return fail(AppendErrorInvalid, fmt.Errorf(
+				"previous entry is required for index %d",
+				req.PrevIndex,
+			))
+		}
+		if !sameEntry(previous, *req.PrevEntry) {
+			return fail(AppendErrorConflict, fmt.Errorf(
+				"conflicting previous entry at index %d",
+				req.PrevIndex,
+			))
+		}
+	} else if req.PrevEntry != nil {
+		return fail(AppendErrorInvalid, fmt.Errorf(
+			"previous entry must be nil when previous index is zero",
+		))
 	}
 
 	// empty append is only valid, when it refers to current index
 	if len(req.Entries) == 0 {
 		if req.PrevIndex != f.lastApplied {
-			return fail(fmt.Errorf(
+			return fail(AppendErrorGap, fmt.Errorf(
 				"empty append has stale prev index: got %d want %d",
 				req.PrevIndex,
 				f.lastApplied,
@@ -157,7 +175,7 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 
 	for _, entry := range req.Entries {
 		if entry.Index != expectedRequestIndex {
-			return fail(fmt.Errorf(
+			return fail(AppendErrorInvalid, fmt.Errorf(
 				"entry sequence mismatch: got index %d want %d",
 				entry.Index,
 				expectedRequestIndex,
@@ -166,14 +184,14 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 		expectedRequestIndex++
 
 		if err := validateCommand(entry.Command); err != nil {
-			return fail(err)
+			return fail(AppendErrorInvalid, err)
 		}
 
 		// already applied entries are allowed so a lost resp can be retried
 		if entry.Index <= f.lastApplied {
 			existing, ok := f.entries[entry.Index] // check tracker
 			if !ok {
-				return fail(fmt.Errorf(
+				return fail(AppendErrorGap, fmt.Errorf(
 					"entry %d is already applied but not available for comparison",
 					entry.Index,
 				))
@@ -181,7 +199,7 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 
 			// if the previously stored is not same as new request
 			if !sameEntry(existing, entry) {
-				return fail(fmt.Errorf(
+				return fail(AppendErrorConflict, fmt.Errorf(
 					"conflicting entry at index %d",
 					entry.Index,
 				))
@@ -190,7 +208,7 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 		}
 
 		if entry.Index != simulatedLastIndex+1 {
-			return fail(fmt.Errorf(
+			return fail(AppendErrorGap, fmt.Errorf(
 				"entry index gap: got %d want %d",
 				entry.Index,
 				simulatedLastIndex+1,
@@ -208,7 +226,7 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 		record := entryToRecord(entry)
 
 		if err := f.wal.Append(record); err != nil {
-			return fail(fmt.Errorf("append follower WAL: %w", err))
+			return fail(AppendErrorInternal, fmt.Errorf("append follower WAL: %w", err))
 		}
 
 		applyCommand(f.store, entry.Command)

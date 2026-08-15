@@ -42,12 +42,27 @@ type Entry struct {
 type AppendRequest struct {
 	LeaderID  string
 	PrevIndex uint64
+	// PrevEntry is the entry the leader believes exists at PrevIndex. It is
+	// required when PrevIndex > 0 so the follower can detect divergent logs,
+	// not merely missing indexes.
+	PrevEntry *Entry
 	Entries   []Entry
 }
+
+type AppendErrorCode string
+
+const (
+	AppendErrorNone     AppendErrorCode = ""
+	AppendErrorInvalid  AppendErrorCode = "invalid"
+	AppendErrorGap      AppendErrorCode = "gap"
+	AppendErrorConflict AppendErrorCode = "conflict"
+	AppendErrorInternal AppendErrorCode = "internal"
+)
 
 // follower sends back
 type AppendResponse struct {
 	Success   bool
 	LastIndex uint64
+	Code      AppendErrorCode
 	Error     string
 }

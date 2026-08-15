@@ -2,10 +2,13 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 )
+
+var ErrReplicationConflict = errors.New("replication: follower log conflict")
 
 const (
 	replicationBatchSize = 64
@@ -19,6 +22,8 @@ type FollowerState struct {
 	Addr      string
 	NextIndex uint64
 	Client    PeerClient
+	Stopped   bool
+	LastError string
 
 	// wake tells the worker leader has new entries
 	wake chan struct{}
@@ -44,6 +49,10 @@ func NewLeader(
 	nodeId string,
 	initialEntries []Entry,
 	followerAddrs []string) (*Leader, error) {
+	if nodeId == "" {
+		return nil, fmt.Errorf("replication: leader ID cannot be empty")
+	}
+
 	entries := make([]Entry, len(initialEntries))
 
 	// rebuild from wal to entries
@@ -56,7 +65,24 @@ func NewLeader(
 				expectedIndex,
 			)
 		}
+		if err := validateCommand(entry.Command); err != nil {
+			return nil, fmt.Errorf(
+				"replication: invalid recovered entry %d: %w",
+				entry.Index,
+				err,
+			)
+		}
 		entries[i] = cloneEntry(entry) //
+	}
+
+	// Validate the complete follower configuration before starting any
+	// workers. Otherwise, an invalid address later in the slice could cause
+	// this constructor to return while workers for earlier addresses are still
+	// running.
+	for _, addr := range followerAddrs {
+		if addr == "" {
+			return nil, fmt.Errorf("replication: follower address is empty")
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,10 +98,6 @@ func NewLeader(
 	// for each follower, create connection, nextIndex+1, create wake signal
 	// start replciation goroutine
 	for _, addr := range followerAddrs {
-		if addr == "" {
-			return nil, fmt.Errorf("replication: follower address is empty")
-		}
-
 		if _, exists := leader.followers[addr]; exists {
 			continue
 		}
@@ -106,6 +128,13 @@ func (l *Leader) followerWorker(follower *FollowerState) {
 	for {
 		more, err := l.replicateNextBatch(follower)
 		if err != nil {
+			if errors.Is(err, ErrReplicationConflict) {
+				l.mu.Lock()
+				follower.Stopped = true
+				follower.LastError = err.Error()
+				l.mu.Unlock()
+				return
+			}
 			if !l.waitForRetry(backoff) {
 				return
 			}
@@ -141,6 +170,10 @@ func (l *Leader) Replicate(ctx context.Context, entry Entry) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
+	}
+
+	if err := validateCommand(entry.Command); err != nil {
+		return err
 	}
 
 	l.mu.Lock()
@@ -248,11 +281,17 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 	}
 	prevIndex := nextIndex - 1
 	leaderID := l.ID
+	var prevEntry *Entry
+	if prevIndex > 0 {
+		previous := cloneEntry(l.entries[prevIndex-1])
+		prevEntry = &previous
+	}
 	l.mu.Unlock()
 
 	req := AppendRequest{
 		LeaderID:  leaderID,
 		PrevIndex: prevIndex,
+		PrevEntry: prevEntry,
 		Entries:   entries,
 	}
 
@@ -269,9 +308,34 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 	}
 
 	if !resp.Success {
-		// The follower tells us the last index it actually has. Resume from
-		// there instead of retrying the same invalid request forever.
+		if resp.Code == AppendErrorConflict {
+			return false, fmt.Errorf(
+				"%w: follower %s rejected append: %s",
+				ErrReplicationConflict,
+				follower.Addr,
+				resp.Error,
+			)
+		}
+		if resp.Code != AppendErrorGap {
+			return false, fmt.Errorf(
+				"follower %s rejected append (%s): %s",
+				follower.Addr,
+				resp.Code,
+				resp.Error,
+			)
+		}
+		// Only a gap is recoverable. Resume from the follower's reported
+		// position; invalid requests and conflicts require intervention.
 		l.mu.Lock()
+		if resp.LastIndex > uint64(len(l.entries)) {
+			l.mu.Unlock()
+			return false, fmt.Errorf(
+				"follower %s reported gap position %d beyond leader last index %d",
+				follower.Addr,
+				resp.LastIndex,
+				len(l.entries),
+			)
+		}
 		follower.NextIndex = resp.LastIndex + 1
 		l.mu.Unlock()
 		return false, fmt.Errorf(
