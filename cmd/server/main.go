@@ -70,8 +70,10 @@ func run() error {
 
 	switch role {
 	case replication.RoleLeader:
+		fmt.Printf("starting leader\n")
 		return runLeader(ctx, opts)
 	case replication.RoleFollower:
+		fmt.Printf("starting follower\n")
 		return runFollower(ctx, opts)
 	default:
 		return fmt.Errorf("unsupported role : %s", opts.role)
@@ -91,6 +93,7 @@ func runLeader(ctx context.Context, opts options) error {
 	entries := make([]replication.Entry, 0)
 
 	// replay and apply each command from log
+	fmt.Printf("replaying leader wal\n")
 	err = log.Replay(func(rec wal.Record) error {
 		entry, err := entryFromRecord(rec)
 		if err != nil {
@@ -114,6 +117,7 @@ func runLeader(ctx context.Context, opts options) error {
 	}
 
 	// create leader
+	fmt.Printf("creating leader replicator\n")
 	leaderReplicator, err := replication.NewLeader(
 		opts.nodeID,
 		entries,
@@ -126,6 +130,7 @@ func runLeader(ctx context.Context, opts options) error {
 
 	// once leader created and its memory updated
 	// create a server to listen
+
 	srv := server.NewWithConfig(
 		st,
 		log,

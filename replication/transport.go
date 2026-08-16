@@ -229,7 +229,7 @@ func NewReplicationServer(
 
 	// do nothing for this server until its context is canceled then close server
 	go func() {
-		<-serverCtx.Done()
+		<-serverCtx.Done() // done sends a receive only channel
 		_ = server.Close()
 	}()
 	return server, nil

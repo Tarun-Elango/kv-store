@@ -110,9 +110,10 @@ func NewLeader(
 			wake:      make(chan struct{}, 1),
 		}
 		leader.followers[addr] = follower
-		leader.wg.Add(1)
+		leader.wg.Add(1) // done when followerworker defer
 
 		// goroutine
+		fmt.Printf("	starting go routine for follower: %s\n", follower.Addr)
 		go leader.followerWorker(follower)
 	}
 
