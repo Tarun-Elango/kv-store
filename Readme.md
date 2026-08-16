@@ -7,15 +7,17 @@
 
 
 To run leader :
-go run ./cmd/server \
+cd cmd/server
+go run main.go \
   -node-id=leader-1 \
   -role=leader \
   -client-addr=:9000 \
   -wal=data/leader.wal \
-  -followers=127.0.0.1:9002
+  -followers=127.0.0.1:9002,,127.0.0.1:9003
 
 To run followers :
-go run ./cmd/server \
+cd cmd/server
+go run main.go \
   -node-id=follower-1 \
   -role=follower \
   -client-addr=:9010 \
