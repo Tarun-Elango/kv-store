@@ -194,6 +194,7 @@ func runFollower(ctx context.Context, opts options) error {
 	defer cancel()
 
 	// start replication server
+
 	peerServer, err := replication.NewReplicationServer(
 		runCtx,
 		opts.replicationAddr,
@@ -204,6 +205,7 @@ func runFollower(ctx context.Context, opts options) error {
 		return fmt.Errorf("create replication server: %w", err)
 	}
 
+	fmt.Printf("Creating follower server \n")
 	srv := server.NewWithConfig(
 		st,
 		nil, // follower WAL is owned by replication.Follower

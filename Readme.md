@@ -13,7 +13,7 @@ go run main.go \
   -role=leader \
   -client-addr=:9000 \
   -wal=data/leader.wal \
-  -followers=127.0.0.1:9002,,127.0.0.1:9003
+  -followers=127.0.0.1:9002,127.0.0.1:9003
 
 To run followers :
 cd cmd/server
@@ -27,3 +27,6 @@ go run main.go \
   -leader-addr=127.0.0.1:9000
 
 compare data : cmp cmd/server/data/leader.wal cmd/server/data/follower.wal
+check bytes: 
+xxd cmd/server/data/leader.wal
+xxd cmd/server/data/follower.wal

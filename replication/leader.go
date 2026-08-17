@@ -298,10 +298,14 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 	}
 
 	rpcCtx, cancel := context.WithTimeout(l.ctx, rpcTimeout)
+	fmt.Printf("replicating to %s with prevIndex:%d \n", follower.Addr, req.PrevIndex)
 	resp, err := follower.Client.Append(rpcCtx, req)
 	cancel()
 
 	if err != nil {
+		fmt.Printf("replication to %s failed: %w",
+			follower.Addr,
+			err)
 		return false, fmt.Errorf(
 			"replication to %s failed: %w",
 			follower.Addr,

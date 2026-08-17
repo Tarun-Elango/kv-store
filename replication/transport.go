@@ -208,6 +208,7 @@ func NewReplicationServer(
 	}
 
 	// listne on port
+	fmt.Printf("creating replication server listening on %s \n", addr)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf(
