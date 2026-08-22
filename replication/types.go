@@ -42,10 +42,9 @@ type Entry struct {
 type AppendRequest struct {
 	LeaderID  string
 	PrevIndex uint64
-	// PrevEntry is the entry the leader believes exists at PrevIndex. It is
-	// required when PrevIndex > 0 so the follower can detect divergent logs,
-	// not merely missing indexes.
-	PrevEntry *Entry
+	// If you only sent PrevIndex, the follower would know that entry 5 exists,
+	// but not whether it contains the same data. It could append new entries onto a divergent log.
+	PrevEntry *Entry //can be nil or something, because its pointer it can point to nothing or some address, if it wasnt it has to be something
 	Entries   []Entry
 }
 

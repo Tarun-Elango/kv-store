@@ -121,11 +121,12 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 	}
 
 	if req.PrevIndex > f.lastApplied {
-		return fail(AppendErrorGap, fmt.Errorf(
-			"prev index is ahead of follower: got %d want at most %d",
-			req.PrevIndex,
-			f.lastApplied,
-		))
+		return fail(
+			AppendErrorGap,
+			fmt.Errorf("prev index is ahead of follower: got %d want at most %d",
+				req.PrevIndex,
+				f.lastApplied,
+			))
 	}
 
 	if req.PrevIndex > 0 {

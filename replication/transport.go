@@ -100,7 +100,7 @@ func (c *TCPPeerClient) Append(ctx context.Context, req AppendRequest) (AppendRe
 
 	defer conn.SetDeadline(time.Time{})
 
-	if err := c.encoder.Encode(req); err != nil {
+	if err := c.encoder.Encode(req); err != nil { // req to json, then writes to tcp conn
 		c.invalidateLocked(conn)
 
 		if ctx.Err() != nil {
