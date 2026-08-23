@@ -45,9 +45,9 @@ func run() error {
 
 	flag.StringVar(&opts.nodeID, "node-id", "", "unique node ID")
 	flag.StringVar(&opts.role, "role", "leader", "node role: leader or follower")
-	flag.StringVar(&opts.clientAddr, "client-addr", ":9000", "client listen address")
+	flag.StringVar(&opts.clientAddr, "client-addr", "", "client listen address")
 	flag.StringVar(&opts.replicationAddr, "replication-addr", ":9001", "follower replication listen address")
-	flag.StringVar(&opts.walPath, "wal", "data/wal.log", "WAL file path")
+	flag.StringVar(&opts.walPath, "wal", "", "WAL file path")
 	flag.StringVar(&opts.leaderID, "leader-id", "", "expected leader ID; required for followers")
 	flag.StringVar(&opts.leaderAddr, "leader-addr", "", "leader client address returned to clients")
 	flag.StringVar(&opts.followers, "followers", "", "comma-separated follower replication addresses")
@@ -56,11 +56,25 @@ func run() error {
 	if opts.nodeID == "" {
 		return fmt.Errorf("-node-id is required")
 	}
+
 	role, err := parseRole(opts.role)
 	if err != nil {
 		return err
 	}
-
+	if opts.clientAddr == "" {
+		if role == replication.RoleFollower {
+			opts.clientAddr = ":9010"
+		} else {
+			opts.clientAddr = ":9000"
+		}
+	}
+	if opts.walPath == "" {
+		if role == replication.RoleFollower {
+			opts.walPath = "data/follower.wal"
+		} else {
+			opts.walPath = "data/leader.wal"
+		}
+	}
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
