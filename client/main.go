@@ -7,6 +7,7 @@ import (
 	"kvStore/proto"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -19,7 +20,13 @@ import (
 
 // client that connects to server
 func main() {
-	conn, err := net.Dial("tcp", "localhost:9000")
+	addr, err := serverAddress(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		fmt.Println("connect error:", err)
 		os.Exit(1)
@@ -82,6 +89,23 @@ func main() {
 	if err := scanner.Err(); err != nil {
 		fmt.Println("Scanner error: ", err)
 	}
+}
+
+func serverAddress(args []string) (string, error) {
+	if len(args) == 0 {
+		return "localhost:9000", nil
+	}
+	if len(args) != 1 || !strings.HasPrefix(args[0], "--") {
+		return "", fmt.Errorf("usage: go run main.go --<port>")
+	}
+
+	port := strings.TrimPrefix(args[0], "--")
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", fmt.Errorf("invalid port %q; usage: go run main.go --<port>", port)
+	}
+
+	return "localhost:" + port, nil
 }
 
 // encode, flush, then decode and display the response.
