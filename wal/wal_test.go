@@ -495,3 +495,55 @@ func TestReplayRestoresLastIndex(t *testing.T) {
 		t.Fatalf("LastIndex() = %d, want 7", got)
 	}
 }
+
+func TestTruncateFromReplacesSuffix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.log")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+
+	for _, rec := range []Record{
+		{Index: 1, Op: byte(OpSet), Key: []byte("a"), Value: []byte("one")},
+		{Index: 2, Op: byte(OpSet), Key: []byte("b"), Value: []byte("old")},
+		{Index: 3, Op: byte(OpSet), Key: []byte("c"), Value: []byte("old")},
+	} {
+		if err := log.Append(rec); err != nil {
+			t.Fatalf("append record %d: %v", rec.Index, err)
+		}
+	}
+
+	if err := log.TruncateFrom(2); err != nil {
+		t.Fatalf("truncate suffix: %v", err)
+	}
+	if got := log.LastIndex(); got != 1 {
+		t.Fatalf("last index after truncate = %d, want 1", got)
+	}
+	if err := log.Append(Record{Index: 2, Op: byte(OpSet), Key: []byte("b"), Value: []byte("new")}); err != nil {
+		t.Fatalf("append replacement record: %v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+
+	log, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen WAL: %v", err)
+	}
+	defer log.Close()
+
+	var got []Record
+	if err := log.Replay(func(rec Record) error {
+		got = append(got, rec)
+		return nil
+	}); err != nil {
+		t.Fatalf("replay replacement WAL: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("replayed %d records, want 2", len(got))
+	}
+	if got[0].Index != 1 || got[1].Index != 2 || string(got[1].Value) != "new" {
+		t.Fatalf("replayed records = %#v, want retained prefix plus replacement", got)
+	}
+}

@@ -144,12 +144,25 @@ func (l *Leader) followerWorker(follower *FollowerState) {
 	for {
 		more, err := l.replicateNextBatch(follower)
 		if err != nil {
-			if errors.Is(err, ErrReplicationConflict) {
+			if errors.Is(err, ErrReplicationConflict) { // when prev entry conflicts in follower
 				l.mu.Lock()
-				follower.Stopped = true
+				// Walk backward until the next request's previous entry is a
+				// common prefix. The follower can then truncate its divergent
+				// suffix and apply the leader's replacement entries.
+				if follower.NextIndex > 1 {
+					follower.NextIndex--
+				}
 				follower.LastError = err.Error()
 				l.mu.Unlock()
-				return
+
+				if !l.waitForRetry(backoff) {
+					return
+				}
+				backoff *= 2
+				if backoff > maxRetryBackoff {
+					backoff = maxRetryBackoff
+				}
+				continue
 			}
 			if !l.waitForRetry(backoff) {
 				return
@@ -346,7 +359,7 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 	cancel()
 
 	if err != nil {
-		fmt.Printf("replication to %s failed: %w",
+		fmt.Printf("replication to %s failed: %v",
 			follower.Addr,
 			err)
 		return false, fmt.Errorf(
@@ -433,6 +446,8 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 	}
 
 	follower.NextIndex = resp.LastIndex + 1
+	follower.Stopped = false
+	follower.LastError = ""
 	//More entries may have been appended while the RPC was in flight.
 	return follower.NextIndex <= uint64(len(l.entries)), nil // still some left
 }

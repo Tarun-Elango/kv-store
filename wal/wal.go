@@ -90,6 +90,60 @@ func (l *Log) Append(rec Record) error {
 	return nil
 }
 
+// TruncateFrom removes the record at index and every record after it.
+// It is used when a follower replaces a divergent log suffix with the
+// leader's version. Index is one-based, so TruncateFrom(1) leaves only the
+// WAL header.
+func (l *Log) TruncateFrom(index uint64) error {
+	if index == 0 {
+		return ErrInvalidIndex
+	}
+
+	l.muWal.Lock()
+	defer l.muWal.Unlock()
+
+	if _, err := l.file.Seek(int64(len(walHeader)), io.SeekStart); err != nil { // move cursor to first record
+		return fmt.Errorf("failed to seek WAL start: %w", err)
+	}
+
+	var lastIndex uint64
+	for {
+		position, err := l.file.Seek(0, io.SeekCurrent) // byte offset of the current record in the file
+		if err != nil {
+			return fmt.Errorf("failed to get WAL position: %w", err)
+		}
+
+		record, err := DecodeRecord(l.file) // read the record
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read WAL while truncating: %w", err)
+		}
+
+		if record.Index >= index { // if the record index is >= index , then trucnate from the next record
+			if err := l.file.Truncate(position); err != nil {
+				return fmt.Errorf("truncate WAL from index %d: %w", index, err)
+			}
+			if err := l.file.Sync(); err != nil {
+				return fmt.Errorf("sync truncated WAL: %w", err)
+			}
+			break
+		}
+
+		lastIndex = record.Index
+	}
+
+	if _, err := l.file.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("failed to seek WAL end: %w", err)
+	}
+
+	// The replication log is contiguous. If index is beyond the end,
+	// lastIndex remains the current last record, which makes this a safe no-op.
+	l.lastIndex = lastIndex
+	return nil
+}
+
 // Replay + callback func, apply all commands from file to memory
 func (l *Log) Replay(apply func(Record) error) error {
 	l.muWal.Lock()

@@ -178,10 +178,8 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 		}
 	}
 
-	// validate full request before writing anything
+	// Validate the complete request before changing either disk or memory.
 	expectedRequestIndex := req.PrevIndex + 1
-	simulatedLastIndex := f.lastApplied
-	newEntries := make([]Entry, 0, len(req.Entries))
 
 	for _, entry := range req.Entries {
 		if entry.Index != expectedRequestIndex {
@@ -196,24 +194,40 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 		if err := validateCommand(entry.Command); err != nil {
 			return fail(AppendErrorInvalid, err)
 		}
+	}
 
-		// already applied entries are allowed so a lost resp can be retried
+	// A matching previous entry proves that the logs agree through PrevIndex.
+	// If a later entry differs, discard only the follower's divergent suffix,
+	// rebuild the materialized store from the retained prefix, and accept the
+	// leader's replacement entries below.
+	for _, entry := range req.Entries {
+		if entry.Index > f.lastApplied {
+			break
+		}
+
+		existing, ok := f.entries[entry.Index]
+		if !ok {
+			return fail(AppendErrorGap, fmt.Errorf(
+				"entry %d is already applied but not available for comparison",
+				entry.Index,
+			))
+		}
+
+		if !sameEntry(existing, entry) {
+			if err := f.truncateSuffixLocked(entry.Index); err != nil {
+				return fail(AppendErrorInternal, err)
+			}
+			break
+		}
+	}
+
+	newEntries := make([]Entry, 0, len(req.Entries))
+	simulatedLastIndex := f.lastApplied
+
+	for _, entry := range req.Entries {
+		// Already-applied matching entries are safe retries after a lost
+		// response. Any mismatch was handled by truncating above.
 		if entry.Index <= f.lastApplied {
-			existing, ok := f.entries[entry.Index] // check tracker
-			if !ok {
-				return fail(AppendErrorGap, fmt.Errorf(
-					"entry %d is already applied but not available for comparison",
-					entry.Index,
-				))
-			}
-
-			// if the previously stored is not same as new request
-			if !sameEntry(existing, entry) {
-				return fail(AppendErrorConflict, fmt.Errorf(
-					"conflicting entry at index %d",
-					entry.Index,
-				))
-			}
 			continue
 		}
 
@@ -247,6 +261,61 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 		Success:   true,
 		LastIndex: f.lastApplied,
 	}
+}
+
+// truncateSuffixLocked removes entries beginning at firstIndex from durable
+// storage and rebuilds the follower's materialized store from the retained
+// log prefix. f.mu must be held.
+func (f *Follower) truncateSuffixLocked(firstIndex uint64) error {
+	if firstIndex == 0 || firstIndex > f.lastApplied {
+		return fmt.Errorf("invalid follower truncation index %d", firstIndex)
+	}
+
+	if err := f.wal.TruncateFrom(firstIndex); err != nil {
+		return fmt.Errorf("truncate follower WAL from index %d: %w", firstIndex, err)
+	}
+
+	for index := range f.entries {
+		if index >= firstIndex {
+			delete(f.entries, index)
+		}
+	}
+	f.lastApplied = firstIndex - 1
+
+	if err := f.rebuildStoreLocked(); err != nil {
+		return fmt.Errorf("rebuild follower store: %w", err)
+	}
+
+	return nil
+}
+
+// rebuildStoreLocked atomically replaces the store with the state represented
+// by f.entries[1:lastApplied]. f.mu must be held.
+func (f *Follower) rebuildStoreLocked() error {
+	rebuilt := make(map[string][]byte)
+
+	for index := uint64(1); index <= f.lastApplied; index++ {
+		entry, ok := f.entries[index]
+		if !ok {
+			return fmt.Errorf("missing retained entry %d", index)
+		}
+
+		switch entry.Command.Op {
+		case proto.OpSet:
+			rebuilt[string(entry.Command.Key)] = append([]byte(nil), entry.Command.Value...)
+		case proto.OpDel:
+			delete(rebuilt, string(entry.Command.Key))
+		default:
+			return fmt.Errorf("unsupported retained command op: %d", entry.Command.Op)
+		}
+
+		if index == f.lastApplied {
+			break
+		}
+	}
+
+	f.store.Replace(rebuilt)
+	return nil
 }
 
 func (f *Follower) LastIndex() uint64 {

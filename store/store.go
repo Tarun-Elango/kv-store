@@ -41,6 +41,16 @@ func (s *Store[K, V]) Delete(key K) {
 	delete(s.data, key)
 }
 
+// Replace atomically swaps the store contents. The caller must not mutate data
+// after passing it to Replace.
+// swap entire map in one locked op
+func (s *Store[K, V]) Replace(data map[K]V) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.data = data
+}
+
 func (s *Store[K, V]) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
