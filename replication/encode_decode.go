@@ -23,6 +23,33 @@ const (
 	maxEntriesPerRequest  = 1024
 )
 
+const maxAppendRequestPayload = maxReplicationFrame - 2 // max payload 64MiB -2 bytes
+
+// -2 because the frame also contains:
+// 1 byte protocol version + 1 byte message type
+
+func encodedEntrySize(entry Entry) int {
+	// index + operation + key length + key + value length + value
+	return 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
+}
+
+// if i append theis appendrequest, how many bytes will payload take ?, i.e checks size
+func appendRequestPayloadSize(req AppendRequest) int {
+	// leader ID length + leader ID + previous index +
+	// previous-entry flag + entry count
+	size := 2 + len(req.LeaderID) + 8 + 1 + 4
+
+	if req.PrevEntry != nil {
+		size += encodedEntrySize(*req.PrevEntry)
+	}
+
+	for _, entry := range req.Entries {
+		size += encodedEntrySize(entry)
+	}
+
+	return size
+}
+
 // EncodeAppendRequest writes:
 //
 //	u32 frame length
@@ -39,6 +66,26 @@ func EncodeAppendRequest(w io.Writer, req AppendRequest) error {
 	if err := validateAppendRequest(req); err != nil {
 		return err
 	}
+
+	// check len of entries
+	if len(req.Entries) > maxEntriesPerRequest {
+		return fmt.Errorf(
+			"too many entries: got %d max %d",
+			len(req.Entries),
+			maxEntriesPerRequest,
+		)
+	}
+
+	// check is payload of request valid
+	payloadSize := appendRequestPayloadSize(req)
+	if payloadSize > maxAppendRequestPayload {
+		return fmt.Errorf(
+			"append request is too large: got %d bytes, max %d",
+			payloadSize,
+			maxAppendRequestPayload,
+		)
+	}
+
 	var payload bytes.Buffer
 
 	if err := writeU16(&payload, uint16(len(req.LeaderID))); err != nil {
@@ -68,13 +115,6 @@ func EncodeAppendRequest(w io.Writer, req AppendRequest) error {
 		}
 	}
 
-	if len(req.Entries) > maxEntriesPerRequest {
-		return fmt.Errorf(
-			"too many entries: got %d max %d",
-			len(req.Entries),
-			maxEntriesPerRequest,
-		)
-	}
 	if err := writeU32(&payload, uint32(len(req.Entries))); err != nil {
 		return err
 	}

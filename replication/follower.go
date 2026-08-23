@@ -34,6 +34,13 @@ func NewFollower(
 	if leaderID == "" {
 		return nil, fmt.Errorf("replication: leader ID cannot be empty")
 	}
+	if len(leaderID) > maxLeaderIDLength {
+		return nil, fmt.Errorf(
+			"replication: leader ID is too long: got %d bytes, max %d",
+			len(leaderID),
+			maxLeaderIDLength,
+		)
+	}
 
 	log, err := wal.Open(walPath)
 	if err != nil {

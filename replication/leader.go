@@ -17,6 +17,13 @@ const (
 	rpcTimeout           = 5 * time.Second
 )
 
+const maxAppendPayloadSize = maxReplicationFrame - 2 // protocol byte + message-type byte
+
+func encodedReplicationEntrySize(entry Entry) int {
+	// index + op + key length + key + value length + value
+	return 8 + 1 + 4 + len(entry.Command.Key) + 4 + len(entry.Command.Value)
+}
+
 // each follower state( stored in lader)
 type FollowerState struct {
 	Addr      string
@@ -51,6 +58,13 @@ func NewLeader(
 	followerAddrs []string) (*Leader, error) {
 	if nodeId == "" {
 		return nil, fmt.Errorf("replication: leader ID cannot be empty")
+	}
+	if len(nodeId) > maxLeaderIDLength {
+		return nil, fmt.Errorf(
+			"replication: leader ID is too long: got %d bytes, max %d",
+			len(nodeId),
+			maxLeaderIDLength,
+		)
 	}
 
 	entries := make([]Entry, len(initialEntries)) // this is leaders private in memory log
@@ -266,28 +280,57 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 			logLength,
 		)
 	}
-	var entries []Entry
-	// check if anything to send
-	if nextIndex <= logLength {
-		start := int(nextIndex - 1)         //entry.index to slice
-		end := start + replicationBatchSize // send a batch
-		if end > len(l.entries) {
-			end = len(l.entries)
-		}
 
-		// make seperate batch
-		entries = make([]Entry, end-start)
-		for i := range entries {
-			entries[i] = cloneEntry(l.entries[start+i])
-		}
-	}
 	prevIndex := nextIndex - 1
 	leaderID := l.ID
+
 	var prevEntry *Entry
 	if prevIndex > 0 {
 		previous := cloneEntry(l.entries[prevIndex-1])
 		prevEntry = &previous
 	}
+
+	// Bytes before the request's Entries array:
+	//
+	// leader-ID length + leader ID + previous index +
+	// previous-entry flag + entry count
+	payloadSize := 2 + len(leaderID) + 8 + 1 + 4
+
+	if prevEntry != nil {
+		payloadSize += encodedReplicationEntrySize(*prevEntry)
+	}
+
+	if payloadSize > maxAppendPayloadSize {
+		l.mu.Unlock()
+		return false, fmt.Errorf("replication request metadata exceeds frame limit")
+	}
+
+	// Add entries only while they fit in the frame.
+	entries := make([]Entry, 0, replicationBatchSize)
+
+	for index := nextIndex; index <= logLength && len(entries) < replicationBatchSize; index++ {
+		entry := cloneEntry(l.entries[index-1])
+		entrySize := encodedReplicationEntrySize(entry)
+
+		if payloadSize+entrySize > maxAppendPayloadSize {
+			// Send what already fits. The next worker iteration sends this entry.
+			if len(entries) > 0 {
+				break
+			}
+
+			// This should not happen with the current 16 MiB value limit,
+			// but prevents an endless oversized request in the future.
+			l.mu.Unlock()
+			return false, fmt.Errorf(
+				"replication entry %d is too large for one frame",
+				entry.Index,
+			)
+		}
+
+		entries = append(entries, entry)
+		payloadSize += entrySize
+	}
+
 	l.mu.Unlock()
 
 	req := AppendRequest{

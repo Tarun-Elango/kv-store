@@ -2,11 +2,23 @@ package replication
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"kvStore/proto"
 	"kvStore/store"
 )
+
+func TestNewFollowerRejectsOversizedLeaderID(t *testing.T) {
+	_, err := NewFollower(
+		filepath.Join(t.TempDir(), "follower.wal"),
+		store.NewStore[string, []byte](),
+		strings.Repeat("l", maxLeaderIDLength+1),
+	)
+	if err == nil {
+		t.Fatal("NewFollower accepted a leader ID longer than the wire limit")
+	}
+}
 
 // TestFollowerRejectsConflictingPreviousEntry checks that a follower detects when the leader's previous log entry does not match its own.
 func TestFollowerRejectsConflictingPreviousEntry(t *testing.T) {

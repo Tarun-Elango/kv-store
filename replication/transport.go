@@ -5,10 +5,8 @@ package replication
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -22,11 +20,9 @@ type PeerClient interface {
 type TCPPeerClient struct {
 	addr string
 
-	mu      sync.Mutex
-	conn    net.Conn
-	encoder *json.Encoder
-	decoder *json.Decoder
-	closed  bool
+	mu     sync.Mutex
+	conn   net.Conn
+	closed bool
 }
 
 func NewTCPPeerClient(addr string) *TCPPeerClient {
@@ -80,8 +76,6 @@ func (c *TCPPeerClient) Append(ctx context.Context, req AppendRequest) (AppendRe
 			)
 		}
 		c.conn = conn
-		c.encoder = json.NewEncoder(conn)
-		c.decoder = json.NewDecoder(conn)
 	}
 
 	conn := c.conn
@@ -100,7 +94,7 @@ func (c *TCPPeerClient) Append(ctx context.Context, req AppendRequest) (AppendRe
 
 	defer conn.SetDeadline(time.Time{})
 
-	if err := c.encoder.Encode(req); err != nil { // req to json, then writes to tcp conn
+	if err := EncodeAppendRequest(conn, req); err != nil { // req to json, then writes to tcp conn
 		c.invalidateLocked(conn)
 
 		if ctx.Err() != nil {
@@ -113,8 +107,9 @@ func (c *TCPPeerClient) Append(ctx context.Context, req AppendRequest) (AppendRe
 		)
 	}
 
-	var resp AppendResponse
-	if err := c.decoder.Decode(&resp); err != nil {
+	resp, err := DecodeAppendResponse(conn)
+
+	if err != nil {
 		c.invalidateLocked(conn)
 
 		if ctx.Err() != nil {
@@ -140,8 +135,6 @@ func (c *TCPPeerClient) Append(ctx context.Context, req AppendRequest) (AppendRe
 func (c *TCPPeerClient) invalidateLocked(conn net.Conn) {
 	if c.conn == conn {
 		c.conn = nil
-		c.encoder = nil
-		c.decoder = nil
 	}
 
 	_ = conn.Close()
@@ -168,8 +161,6 @@ func (c *TCPPeerClient) Close() error {
 
 	err := c.conn.Close()
 	c.conn = nil
-	c.encoder = nil
-	c.decoder = nil
 	return err
 }
 
@@ -366,37 +357,26 @@ func serveReplicationConnection(
 		ctx = context.Background()
 	}
 
-	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
-
 	for {
 		if err := ctx.Err(); err != nil {
 			return
 		}
 
-		var req AppendRequest
-		if err := decoder.Decode(&req); err != nil { // <- blocking, until appendrequest arrives
-			if errors.Is(err, io.EOF) {
-				return
-			}
+		req, err := DecodeAppendRequest(conn)
+		if err != nil {
 
-			if ctx.Err() != nil {
-				return
-			}
-
-			_ = encoder.Encode(AppendResponse{
+			_ = EncodeAppendResponse(conn, AppendResponse{
 				Success: false,
-				Error: fmt.Sprintf(
-					"replication: decode append request: %v",
-					err,
-				),
+				Code:    AppendErrorInvalid,
+				Error:   fmt.Sprintf("decode append request: %v", err),
 			})
 			return
 		}
 
 		if follower == nil {
-			_ = encoder.Encode(AppendResponse{
+			_ = EncodeAppendResponse(conn, AppendResponse{
 				Success: false,
+				Code:    AppendErrorInternal,
 				Error:   "replication: nil follower",
 			})
 			return
@@ -404,7 +384,7 @@ func serveReplicationConnection(
 
 		resp := follower.ApplyAppend(req) // actual append work
 
-		if err := encoder.Encode(resp); err != nil {
+		if err := EncodeAppendResponse(conn, resp); err != nil {
 			return
 		}
 	}

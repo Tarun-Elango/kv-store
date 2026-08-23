@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"kvStore/proto"
@@ -11,6 +12,12 @@ import (
 func TestNewLeaderRejectsEmptyID(t *testing.T) {
 	if _, err := NewLeader("", nil, nil); err == nil {
 		t.Fatal("NewLeader accepted an empty leader ID")
+	}
+}
+
+func TestNewLeaderRejectsOversizedID(t *testing.T) {
+	if _, err := NewLeader(strings.Repeat("l", maxLeaderIDLength+1), nil, nil); err == nil {
+		t.Fatal("NewLeader accepted a leader ID longer than the wire limit")
 	}
 }
 
