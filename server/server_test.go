@@ -5,33 +5,37 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"kvStore/proto"
 	"kvStore/store"
 	"kvStore/wal"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
-func newTestServer() (*Server, error) {
-	log, err := wal.Open("data/wal-test.log")
+func newTestServer(t *testing.T) *Server {
+	t.Helper() // tell its a helper func
+
+	log, err := wal.Open(filepath.Join(t.TempDir(), "data/wal.log"))
 	if err != nil {
-		return nil, err
+		t.Fatalf("open test WAL: %v", err)
 	}
-	return New(store.NewStore[string, []byte](), log), nil
+	s := New(store.NewStore[string, []byte](), log)
+	t.Cleanup(s.shutdown)
+	return s
 }
 
 // TestDispatch verifies each command's store-facing behavior without requiring
 // a TCP listener. It also covers the only response statuses dispatch can return.
 func TestDispatch(t *testing.T) {
-	s, err := newTestServer()
-	if err != nil {
-		fmt.Print("wal open error:", err)
-	}
+	s := newTestServer(t)
 
 	response, err := s.dispatch(proto.Command{Op: proto.OpGet, Key: []byte("missing")})
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
 	if response.Status != proto.StatusNotFound {
 		t.Fatalf("missing GET status = %d, want %d", response.Status, proto.StatusNotFound)
 	}
@@ -84,10 +88,8 @@ func TestDispatch(t *testing.T) {
 // TestHandleConnMultipleCommands verifies that one client connection can carry
 // several encoded requests and receives responses in the same order.
 func TestHanldeConnMultipleCommands(t *testing.T) {
-	s, err := newTestServer()
-	if err != nil {
-		fmt.Print("wal open error:", err)
-	}
+	s := newTestServer(t)
+
 	serverConn, clientConn := net.Pipe() // duplex connection
 	defer clientConn.Close()
 
@@ -142,10 +144,8 @@ func TestHanldeConnMultipleCommands(t *testing.T) {
 // TestHandleConnRejectsMalformedRequest ensures an invalid frame ends handling
 // instead of allowing the connection to continue with an undefined request.
 func TestHandleConnRejectsMalformedRequest(t *testing.T) {
-	s, err := newTestServer()
-	if err != nil {
-		fmt.Print("wal open error:", err)
-	}
+	s := newTestServer(t)
+
 	serverConn, clientConn := net.Pipe()
 	done := make(chan error, 1)
 	go func() {
@@ -158,7 +158,7 @@ func TestHandleConnRejectsMalformedRequest(t *testing.T) {
 		t.Fatalf("write malformed request: %v", err)
 	}
 
-	err = <-done
+	err := <-done
 	if !errors.Is(err, proto.ErrUnknownOpcode) {
 		t.Fatalf("handleConn error = %v, want ErrUnknownOpcode", err)
 	}
@@ -167,10 +167,8 @@ func TestHandleConnRejectsMalformedRequest(t *testing.T) {
 // TestShutdownStopsActiveHandler verifies cancellation closes an in-flight
 // connection and waits until its handler has finished cleanup.
 func TestShutdownStopsActiveHandler(t *testing.T) {
-	s, err := newTestServer()
-	if err != nil {
-		fmt.Print("wal open error:", err)
-	}
+	s := newTestServer(t)
+
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
@@ -202,7 +200,7 @@ func TestShutdownStopsActiveHandler(t *testing.T) {
 	}
 
 	// peer must observe that its connection cannot be used anymore
-	_, err = clientConn.Write([]byte{proto.OpPing})
+	_, err := clientConn.Write([]byte{proto.OpPing})
 	if err == nil {
 		t.Fatal("write to connection after shutdown succeeded, want an error")
 	}

@@ -136,7 +136,7 @@ func DecodeRecord(r io.Reader) (Record, error) {
 
 }
 
-// decodePayload parses [op][keyLen][key][valLen][value] from an
+// decodePayload parses [index][op][keyLen][key][valLen][value] from an
 // already-fully-read, already-checksum-verified byte slice.
 func decodePayload(payload []byte) (Record, error) {
 	r := bytes.NewReader(payload)

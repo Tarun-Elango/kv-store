@@ -99,6 +99,7 @@ func NewLeader(
 		}
 	}
 
+	// easy way to close / stop something, that thing will check for <- ctx.done(), which is closed by cancel
 	ctx, cancel := context.WithCancel(context.Background())
 
 	//create leader

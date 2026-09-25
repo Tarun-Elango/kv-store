@@ -475,8 +475,10 @@ func TestReplayRestoresLastIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open WAL: %v", err)
 	}
-	if err := log.Append(Record{Index: 7, Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}); err != nil {
-		t.Fatalf("append record: %v", err)
+	for index := uint64(1); index <= 3; index++ {
+		if err := log.Append(Record{Index: index, Op: byte(OpSet), Key: []byte("k"), Value: []byte("v")}); err != nil {
+			t.Fatalf("append record %d: %v", index, err)
+		}
 	}
 	if err := log.Close(); err != nil {
 		t.Fatalf("close WAL: %v", err)
@@ -491,8 +493,45 @@ func TestReplayRestoresLastIndex(t *testing.T) {
 	if err := log.Replay(func(Record) error { return nil }); err != nil {
 		t.Fatalf("replay WAL: %v", err)
 	}
-	if got := log.LastIndex(); got != 7 {
-		t.Fatalf("LastIndex() = %d, want 7", got)
+	if got := log.LastIndex(); got != 3 {
+		t.Fatalf("LastIndex() = %d, want 3", got)
+	}
+}
+
+func TestReplayRejectsNoncontiguousIndexes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		indexes []uint64
+	}{
+		{name: "first index skips one", indexes: []uint64{2}},
+		{name: "gap", indexes: []uint64{1, 3}},
+		{name: "duplicate", indexes: []uint64{1, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log, err := Open(filepath.Join(t.TempDir(), "wal.log"))
+			if err != nil {
+				t.Fatalf("open WAL: %v", err)
+			}
+			defer log.Close()
+
+			for _, index := range tc.indexes {
+				if err := log.Append(Record{Index: index, Op: byte(OpSet), Key: []byte("k")}); err != nil {
+					t.Fatalf("append index %d: %v", index, err)
+				}
+			}
+
+			var applied []uint64
+			err = log.Replay(func(rec Record) error {
+				applied = append(applied, rec.Index)
+				return nil
+			})
+			if !errors.Is(err, ErrIndexOutOfOrder) {
+				t.Fatalf("Replay() error = %v, want ErrIndexOutOfOrder", err)
+			}
+			if len(applied) != len(tc.indexes)-1 {
+				t.Fatalf("applied indexes = %v, want only valid prefix", applied)
+			}
+		})
 	}
 }
 

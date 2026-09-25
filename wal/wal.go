@@ -166,7 +166,7 @@ func (l *Log) Replay(apply func(Record) error) error {
 		}
 
 		if errors.Is(err, ErrIncompleteRecord) {
-			// remove incomplete record and all after
+			// remove incomplete record and all after, done on purpose
 			if err := l.file.Truncate(pos); err != nil {
 				return fmt.Errorf("failed to truncate incomplete WAL tail: %w", err)
 			}
@@ -177,12 +177,12 @@ func (l *Log) Replay(apply func(Record) error) error {
 			return err
 		}
 
-		if rec.Index <= l.lastIndex {
+		if rec.Index != l.lastIndex+1 {
 			return fmt.Errorf(
-				"%w: got index %d after %d",
+				"%w: got index %d, want %d",
 				ErrIndexOutOfOrder,
 				rec.Index,
-				l.lastIndex,
+				l.lastIndex+1,
 			)
 		}
 

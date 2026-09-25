@@ -84,13 +84,13 @@ func run() error {
 
 	switch role {
 	case replication.RoleLeader:
-		fmt.Printf("starting leader\n")
+		fmt.Printf("INFO: starting this as a leader Node\n")
 		return runLeader(ctx, opts)
 	case replication.RoleFollower:
-		fmt.Printf("starting follower\n")
+		fmt.Printf("INFO: starting this as a follower\n")
 		return runFollower(ctx, opts)
 	default:
-		return fmt.Errorf("unsupported role : %s", opts.role)
+		return fmt.Errorf("ERROR: unsupported role : %s", opts.role)
 	}
 
 }
@@ -101,13 +101,13 @@ func runLeader(ctx context.Context, opts options) error {
 	// open wal
 	log, err := wal.Open(opts.walPath)
 	if err != nil {
-		return fmt.Errorf("open leader WAL: %w", err)
+		return fmt.Errorf("ERROR: open leader WAL: %w", err)
 	}
 
 	entries := make([]replication.Entry, 0)
 
 	// replay and apply each command from log
-	fmt.Printf("replaying leader wal\n")
+	fmt.Printf("INFO: replaying leader wal while restarting\n")
 	err = log.Replay(func(rec wal.Record) error {
 		entry, err := entryFromRecord(rec)
 		if err != nil {
@@ -131,7 +131,7 @@ func runLeader(ctx context.Context, opts options) error {
 	}
 
 	// create leader
-	fmt.Printf("creating leader replicator\n")
+	fmt.Printf("INFO: creating leader replicator server\n")
 	leaderReplicator, err := replication.NewLeader(
 		opts.nodeID,
 		entries,

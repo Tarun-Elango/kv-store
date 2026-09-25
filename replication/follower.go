@@ -56,15 +56,6 @@ func NewFollower(
 
 	fmt.Printf("Creating follower and replaying log\n")
 	err = log.Replay(func(rec wal.Record) error {
-		// check index is sequential, is last is 0, first record must be 1
-		if rec.Index != f.lastApplied+1 {
-			return fmt.Errorf(
-				"follower WAL index gap: got %d, want %d",
-				rec.Index,
-				f.lastApplied+1,
-			)
-		}
-
 		entry, err := recordToEntry(rec) // record to entry
 		if err != nil {
 			return err
@@ -253,8 +244,8 @@ func (f *Follower) ApplyAppend(req AppendRequest) AppendResponse {
 			return fail(AppendErrorInternal, fmt.Errorf("append follower WAL: %w", err))
 		}
 
-		applyCommand(f.store, entry.Command)
-		f.entries[entry.Index] = cloneEntry(entry)
+		applyCommand(f.store, entry.Command)       // update store
+		f.entries[entry.Index] = cloneEntry(entry) // update entries
 		f.lastApplied = entry.Index
 	}
 	return AppendResponse{
