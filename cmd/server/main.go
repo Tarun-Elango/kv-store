@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"kvStore/proto"
@@ -9,10 +10,14 @@ import (
 	"kvStore/server"
 	"kvStore/store"
 	"kvStore/wal"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // imports the server package,
@@ -81,6 +86,29 @@ func run() error {
 		syscall.SIGTERM,
 	)
 	defer stop()
+
+	// Expose Go's pprof endpoints on localhost, separately from the TCP client
+	// listener. Binding the listener here enables profiling for either role.
+	pprofListener, err := net.Listen("tcp", "127.0.0.1:8080")
+	if err != nil {
+		return fmt.Errorf("start pprof listener on 127.0.0.1:8080: %w", err)
+	}
+	pprofServer := &http.Server{}
+	defer pprofServer.Close()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := pprofServer.Shutdown(shutdownCtx); err != nil {
+			_ = pprofServer.Close()
+		}
+	}()
+	go func() {
+		if err := pprofServer.Serve(pprofListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "pprof server: %v\n", err)
+		}
+	}()
 
 	switch role {
 	case replication.RoleLeader:
