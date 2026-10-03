@@ -387,6 +387,7 @@ func (l *Leader) replicateNextBatch(follower *FollowerState) (bool, error) {
 				resp.Error,
 			)
 		}
+		// will be AppendErrorGap now
 		// Only a gap is recoverable. Resume from the follower's reported
 		// position; invalid requests and conflicts require intervention.
 		l.mu.Lock()

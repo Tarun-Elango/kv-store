@@ -142,7 +142,11 @@ func send(reader io.Reader, writer *bufio.Writer, command proto.Command) {
 	case proto.StatusNotFound:
 		fmt.Println("key not found")
 	case proto.StatusError:
-		fmt.Println("server error")
+		if len(resp.Value) > 0 {
+			fmt.Printf("server error: %s\n", string(resp.Value))
+		} else {
+			fmt.Println("server error (no details provided)")
+		}
 	case proto.StatusNotLeader:
 		fmt.Printf("not leader; use %s\n", string(resp.Value))
 	default:

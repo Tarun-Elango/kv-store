@@ -40,7 +40,8 @@ type Server struct {
 	leaderReplicator   *replication.Leader
 	followerReplicator *replication.Follower
 
-	writeMu sync.Mutex //serialize index allocation
+	writeMu  sync.Mutex //serialize index allocation
+	writeErr error      // first WAL append/sync failure; protected by writeMu
 
 	listener    net.Listener          // lets shutdown() close it, cause shutdown can be called from different routine,
 	connections map[net.Conn]struct{} // clientConn1: {}, clientConn2: {}
@@ -256,6 +257,14 @@ func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	// we had error set before, so return
+	if s.writeErr != nil {
+		return proto.Response{
+			Status: proto.StatusError,
+			Value:  []byte("writes are disabled after a WAL error: " + s.writeErr.Error()),
+		}, nil
+	}
+
 	if s.log == nil {
 		return proto.Response{
 			Status: proto.StatusError,
@@ -282,6 +291,10 @@ func (s *Server) applyLeaderWrite(cmd proto.Command) (proto.Response, error) {
 
 	//durable local write first.
 	if err := s.log.Append(record); err != nil {
+		// A failed append or sync may have left a partial record, or may have
+		// persisted the record despite returning an error. Do not append behind
+		// that uncertain state; require a restart and WAL replay first.
+		s.writeErr = err
 		return proto.Response{
 			Status: proto.StatusError,
 			Value:  []byte(err.Error()),
