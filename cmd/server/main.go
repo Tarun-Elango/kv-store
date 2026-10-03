@@ -30,6 +30,7 @@ type options struct {
 	role            string
 	clientAddr      string
 	replicationAddr string
+	pprofAddr       string
 	walPath         string
 	leaderID        string
 	leaderAddr      string
@@ -52,6 +53,7 @@ func run() error {
 	flag.StringVar(&opts.role, "role", "leader", "node role: leader or follower")
 	flag.StringVar(&opts.clientAddr, "client-addr", "", "client listen address")
 	flag.StringVar(&opts.replicationAddr, "replication-addr", ":9001", "follower replication listen address")
+	flag.StringVar(&opts.pprofAddr, "pprof-addr", "", "optional pprof HTTP listen address")
 	flag.StringVar(&opts.walPath, "wal", "", "WAL file path")
 	flag.StringVar(&opts.leaderID, "leader-id", "", "expected leader ID; required for followers")
 	flag.StringVar(&opts.leaderAddr, "leader-addr", "", "leader client address returned to clients")
@@ -89,26 +91,28 @@ func run() error {
 
 	// Expose Go's pprof endpoints on localhost, separately from the TCP client
 	// listener. Binding the listener here enables profiling for either role.
-	pprofListener, err := net.Listen("tcp", "127.0.0.1:8080")
-	if err != nil {
-		return fmt.Errorf("start pprof listener on 127.0.0.1:8080: %w", err)
-	}
-	pprofServer := &http.Server{}
-	defer pprofServer.Close()
+	if opts.pprofAddr != "" {
+		pprofListener, err := net.Listen("tcp", opts.pprofAddr)
+		if err != nil {
+			return fmt.Errorf("start pprof listener on %s: %w", opts.pprofAddr, err)
+		}
+		pprofServer := &http.Server{}
+		defer pprofServer.Close()
 
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := pprofServer.Shutdown(shutdownCtx); err != nil {
-			_ = pprofServer.Close()
-		}
-	}()
-	go func() {
-		if err := pprofServer.Serve(pprofListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Fprintf(os.Stderr, "pprof server: %v\n", err)
-		}
-	}()
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := pprofServer.Shutdown(shutdownCtx); err != nil {
+				_ = pprofServer.Close()
+			}
+		}()
+		go func() {
+			if err := pprofServer.Serve(pprofListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Fprintf(os.Stderr, "pprof server: %v\n", err)
+			}
+		}()
+	}
 
 	switch role {
 	case replication.RoleLeader:

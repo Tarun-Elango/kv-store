@@ -18,6 +18,9 @@ go run main.go \
   -wal=data/leader.wal \
   -followers=127.0.0.1:9002,127.0.0.1:9003
 
+#### Optional for profiling: add `-pprof-addr=127.0.0.1:8080` to the command.
+#### Leave it out to keep pprof disabled. Each server process needs its own port.
+
 ### To run followers :
 cd cmd/server
 go run main.go \
